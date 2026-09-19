@@ -53,6 +53,17 @@ class Draft:
     last_query: dict = field(default_factory=dict)
 
 
+def _cn_number(n: int) -> str:
+    """1-31 as spoken Chinese: 21 -> 二十一. Enough for months and days."""
+    digits = "零一二三四五六七八九"
+    if n < 10:
+        return digits[n]
+    if n == 10:
+        return "十"
+    tens, ones = divmod(n, 10)
+    return ("十" if tens == 1 else digits[tens] + "十") + (digits[ones] if ones else "")
+
+
 def speak_time(iso: str) -> str:
     """RFC3339 -> something a person can hear. Never read codes aloud."""
     dt = datetime.fromisoformat(iso)
@@ -324,7 +335,14 @@ class Agent:
             return False
         if self.draft.doctor_name not in text:
             return False
-        return any(token in text for token in self._hour_tokens(self.draft.starts_at))
+        # Hour alone is not enough. Slots run the same hours every day for a
+        # week, so 「禮拜三下午三點」 would satisfy an hour-only check for a
+        # Thursday draft: the caller hears Wednesday, says 確認, and book writes
+        # the Thursday slot_id, which nothing downstream can catch because book
+        # never sees what was spoken. A bare hour is genuinely ambiguous to the
+        # caller too, so requiring a day is honest as well as safe.
+        return (any(t in text for t in self._hour_tokens(self.draft.starts_at))
+                and any(t in text for t in self._day_tokens(self.draft.starts_at)))
 
     @staticmethod
     def _hour_tokens(starts_at: str) -> set[str]:
@@ -334,6 +352,20 @@ class Agent:
         dt = datetime.fromisoformat(starts_at)
         twelve = dt.hour - 12 if dt.hour > 12 else (12 if dt.hour == 0 else dt.hour)
         return {f"{dt.hour}點", f"{twelve}點", f"{cn[twelve]}點"}
+
+    @staticmethod
+    def _day_tokens(starts_at: str) -> set[str]:
+        """The date and the weekday, in the spellings a person actually says."""
+        dt = datetime.fromisoformat(starts_at)
+        day, weekday = dt.day, "一二三四五六日"[dt.weekday()]
+        cn_day = _cn_number(day)
+        cn_month = _cn_number(dt.month)
+        return {
+            f"{dt.month}月{day}號", f"{dt.month}月{day}日",
+            f"{cn_month}月{cn_day}號", f"{cn_month}月{cn_day}日",
+            f"{day}號", f"{day}日", f"{cn_day}號", f"{cn_day}日",
+            f"禮拜{weekday}", f"星期{weekday}", f"週{weekday}",
+        }
 
     # -- bookkeeping -------------------------------------------------------
 
