@@ -76,6 +76,26 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "confirm",
+            "description": "當你判斷來電者真的答應了這個時段時呼叫。"
+                           "「好啊但是我想先問一下」「好像可以」「可以嗎？」都不算答應。"
+                           "呼叫前必須already讀回醫師姓名和完整時間。"
+                           "系統會再驗一次前置條件，驗不過就不會開啟。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "quote": {
+                        "type": "string",
+                        "description": "來電者表示同意的原話，照抄不要改寫。",
+                    },
+                },
+                "required": ["quote"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "book",
             "description": "建立預約。只有在來電者明確口頭確認後才可以呼叫。",
             "parameters": {

@@ -76,6 +76,10 @@ class Agent:
         self.state = State.GREETING
         self.messages = [{"role": "system", "content": system_prompt()}]
         self.transcript: list[tuple[str, str]] = []
+        self.handoff_reason: str | None = None
+        self._last_said: str | None = None
+        self._last_readback: str | None = None
+        self._spoke_since_readback = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -96,19 +100,52 @@ class Agent:
         self.state = State.INTENT
         return self._say(self.driver.greet(found))
 
+    HANDOFF_LINE = "這部分我幫您轉接櫃檯人員，請稍等。"
+
     def turn(self, said: str) -> str:
         self.transcript.append(("caller", said))
+
+        # Terminal by construction. Once handed off, the driver is never
+        # consulted again — otherwise the agent says "transferring you" and
+        # then keeps talking, which is worse than never offering transfer.
+        if self.state is State.HANDOFF:
+            return self._say(self.HANDOFF_LINE)
+
         self.messages.append({"role": "user", "content": said})
-        if self._is_affirmation(said) and self.state == State.CONFIRMING:
-            self.draft.confirmed = True
-        elif self._is_revision(said):
+        self._last_said = said
+        if self._last_readback:
+            self._spoke_since_readback = True
+        if self._is_revision(said):
             self.draft.confirmed = False
-        return self._say(self.driver.respond(self, said))
+
+        reply = self.driver.respond(self, said)
+        if self.state is State.HANDOFF:
+            return self._say(self.HANDOFF_LINE)
+        return self._say(reply)
+
+    def handoff_event(self) -> dict | None:
+        """What the phone layer acts on: SIP REFER, or bridge to the extension.
+
+        Emitted as data rather than performed here, because transferring to a
+        clinic extension is something only the telephony layer in front of us
+        can do — the model provider cannot do it on our behalf.
+        """
+        if self.state is not State.HANDOFF:
+            return None
+        return {
+            "event": "handoff",
+            "call_id": self.call_id,
+            "phone": self.phone,
+            "reason": self.handoff_reason or "unspecified",
+        }
 
     # -- tool dispatch -----------------------------------------------------
 
     def call_tool(self, name: str, args: dict) -> dict:
         """Every tool call funnels through here, including the model's."""
+        if name == "confirm":
+            return self._confirm(args.get("quote", ""))
+
         if name in WRITE_TOOLS and not self.draft.confirmed:
             # The gate. Refuse rather than write, and say why.
             return {
@@ -138,8 +175,7 @@ class Agent:
             elif name == "cancel":
                 result = clinic_api.cancel(self.call_id, args["appointment_id"])
             elif name == "handoff":
-                self.state = State.HANDOFF
-                return {"handoff": True, "reason": args.get("reason", "")}
+                return self._handoff(args.get("reason", ""))
             else:
                 return {"error": "UNKNOWN_TOOL", "name": name}
 
@@ -154,9 +190,12 @@ class Agent:
                     hint="這個時段已經過了，不是被約走。請重新提供可選時段，不要說被約走。"
                 )
             if exc.code in {"SERVER_ERROR", "UNREACHABLE", "INTERNAL"}:
-                self.state = State.HANDOFF
-                return {"error": exc.code, "handoff": True,
-                        "hint": "系統有狀況，請向來電者致歉並轉接真人。"}
+                # Handoff must be reachable from inside the tool-failure path,
+                # not only from the driver, or a failing service strands the
+                # caller in a loop.
+                result = self._handoff(f"tool {name} failed: {exc.code}")
+                result["hint"] = "系統有狀況，請向來電者致歉並轉接真人。"
+                return result
             return {"error": exc.code, "message": exc.message}
 
         self.draft.appointment_id = result.get("appointment_id")
@@ -181,22 +220,81 @@ class Agent:
             "hint": hint or "那個時段剛被約走。請直接說明並馬上提兩個替代時段，不要只是道歉。",
         }
 
-    # -- caller intent heuristics -----------------------------------------
+    # -- the confirmation gate --------------------------------------------
+    #
+    # An earlier version opened this gate with a regex. It got 6 of 11
+    # realistic utterances wrong and every failure opened the gate when it
+    # should have stayed shut — 「那個時間我不太可以」 is a refusal that booked
+    # an appointment, and 「可以嗎？」 let the agent's own proposal, echoed back
+    # as a question, open its own gate. Chinese affirmation is contextual and a
+    # deny-list is always one particle behind.
+    #
+    # So: the model decides whether the caller consented, because that is a
+    # semantic judgement it is good at. The code decides whether consent was
+    # even possible, using preconditions the model cannot fabricate. The regex
+    # survives only as a veto — it can refuse, never open.
+    #
+    # The bias is deliberate. A false negative costs one more question. A false
+    # positive books a stranger into a doctor's calendar.
 
-    AFFIRM = re.compile(r"(^|[^不])(好|對|可以|沒問題|就這個|就那個|麻煩你|是的|ok|OK)")
+    # 不 covers 不太可以 / 不行 / 不用 — any negation anywhere in the utterance
+    # vetoes, because a refusal that contains a stray 可以 is the single worst
+    # failure this gate can have. Ellipsis catches audible hesitation
+    # (「欸…好…嗯…」). Both will sometimes refuse a genuine yes; that costs one
+    # more question, which is the trade we chose.
+    VETO = re.compile(r"(嗎|呢|吧|但|不過|可是|好像|應該|大概|如果|再想|先問|不|…|\.{3,}|[?？])")
     REVISE = re.compile(r"(不對|不要|改成|換成|等一下|等等|還是|另外|重新)")
-
-    def _is_affirmation(self, said: str) -> bool:
-        return bool(self.AFFIRM.search(said)) and not self.REVISE.search(said)
 
     def _is_revision(self, said: str) -> bool:
         return bool(self.REVISE.search(said))
 
+    def _confirm(self, quote: str) -> dict:
+        """Called by the model when it judges the caller agreed."""
+        if self.state != State.CONFIRMING:
+            return self._refuse("還沒進到確認階段，請先讀回醫師姓名和完整時間。")
+
+        # The read-back must have actually happened, not merely been intended.
+        if not self._last_readback:
+            return self._refuse("你還沒有讀回醫師姓名和完整時間，請先讀回再問對方。")
+
+        # And the caller must have spoken since it, so we are not confirming
+        # against our own voice.
+        if not self._spoke_since_readback:
+            return self._refuse("讀回之後對方還沒有回話，請等對方回應。")
+
+        said = self._last_said or ""
+        if self.VETO.search(said):
+            return self._refuse(
+                f"對方說的是「{said}」，這是猶豫或提問，不是答應。請再問一次確認。"
+            )
+
+        self.draft.confirmed = True
+        return {"confirmed": True, "quote": quote}
+
+    def _refuse(self, hint: str) -> dict:
+        return {"confirmed": False, "hint": hint}
+
+    def _looks_like_readback(self, text: str) -> bool:
+        """A read-back names the doctor and says the time out loud."""
+        if not (self.draft.doctor_name and self.draft.starts_at):
+            return False
+        return self.draft.doctor_name in text and speak_time(self.draft.starts_at) in text
+
     # -- bookkeeping -------------------------------------------------------
+
+    def _handoff(self, reason: str) -> dict:
+        self.state = State.HANDOFF
+        self.handoff_reason = reason
+        return {"handoff": True, "reason": reason}
 
     def _say(self, text: str) -> str:
         self.transcript.append(("agent", text))
         self.messages.append({"role": "assistant", "content": text})
+        # Record the read-back as it actually happens, so the gate checks a
+        # thing that occurred rather than a state we hoped implied it.
+        if self._looks_like_readback(text):
+            self._last_readback = text
+            self._spoke_since_readback = False
         return text
 
     def _note_system(self, note: str) -> None:
@@ -282,7 +380,7 @@ class ScriptedDriver:
 
         if re.search(r"(症狀|過敏|吃藥|藥物|痛|發燒|真人|專員|櫃檯)", said):
             agent.call_tool("handoff", {"reason": "clinical or human request"})
-            return "這部分我幫您轉接櫃檯人員，請稍等。"
+            return agent.HANDOFF_LINE
 
         if re.search(r"取消", said):
             draft.intent = "cancel"
@@ -312,6 +410,14 @@ class ScriptedDriver:
                 agent.state = State.CONFIRMING
                 return (f"好的，幫您確認一下：{chosen['doctor_name']}醫師，"
                         f"{speak_time(chosen['starts_at'])}。這樣可以嗎？")
+
+        # Stands in for the model's semantic judgement: it proposes consent,
+        # and the agent's preconditions decide whether it counts.
+        if agent.state is State.CONFIRMING and not draft.confirmed:
+            verdict = agent.call_tool("confirm", {"quote": said})
+            if not verdict.get("confirmed"):
+                return f"不好意思，想跟您確認一下：{draft.doctor_name}醫師，" \
+                       f"{speak_time(draft.starts_at)}，這樣可以嗎？"
 
         if draft.confirmed and draft.slot_id and agent.state != State.COMMITTED:
             result = agent.call_tool("book", {
