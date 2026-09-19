@@ -12,6 +12,7 @@ exclusion constraint on this SQLite deployment.
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
@@ -19,7 +20,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).parent
-DB_PATH = HERE / "clinic.db"
+DB_PATH = Path(os.environ.get("CLINIC_DB_PATH", HERE / "clinic.db"))
 SCHEMA = HERE / "schema.sql"
 TZ = ZoneInfo("Asia/Taipei")
 

@@ -16,6 +16,7 @@ so swapping this in for the stub is invisible to the voice workstream.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -29,7 +30,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-DB_PATH = Path(__file__).parent / "clinic.db"
+DB_PATH = Path(os.environ.get("CLINIC_DB_PATH", Path(__file__).parent / "clinic.db"))
 TZ = ZoneInfo("Asia/Taipei")
 
 app = FastAPI(title="Appointment Service", version="1.0")

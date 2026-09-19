@@ -10,7 +10,9 @@ import os
 import urllib.error
 import urllib.request
 
-BASE_URL = os.environ.get("CLINIC_API", "http://127.0.0.1:8787")
+BASE_URL = os.environ.get(
+    "CLINIC_API", f"http://127.0.0.1:{os.environ.get('PORT', '8787')}"
+)
 TIMEOUT = 8
 
 

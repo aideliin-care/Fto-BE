@@ -28,3 +28,9 @@ Voice webhook to `https://your-public-tunnel.example/twilio/voice` using POST.
 signature validation succeeds.
 
 Run the adapter unit test from `voice/` with `python3 -m unittest -v test_telephony`.
+
+## Railway
+
+Railway starts the root `app:app`, which serves both the appointment API and
+Twilio routes on its assigned `$PORT`. Attach a Railway Volume at `/data` and
+set `CLINIC_DB_PATH=/data/clinic.db` before storing real appointments.

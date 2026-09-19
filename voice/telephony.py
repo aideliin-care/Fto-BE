@@ -14,12 +14,14 @@ import os
 from urllib.parse import parse_qs
 from xml.etree import ElementTree as ET
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
 
 from agent import Agent, State, make_driver
 
 app = FastAPI(title="Clinic phone adapter")
+router = APIRouter()
 sessions: dict[str, Agent] = {}
 
 
@@ -119,20 +121,24 @@ async def _twilio_form(request: Request) -> dict[str, str]:
     return form
 
 
-@app.get("/health")
+@router.get("/telephony/health")
 def health() -> dict:
     return {"ok": True, "active_calls": len(sessions)}
 
 
-@app.post("/twilio/voice", response_class=Response)
+@router.post("/twilio/voice", response_class=Response)
 async def incoming_call(request: Request) -> Response:
     try:
-        twiml = start_call(await _twilio_form(request))
+        twiml = await run_in_threadpool(start_call, await _twilio_form(request))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return Response(twiml, media_type="application/xml")
 
 
-@app.post("/twilio/gather", response_class=Response)
+@router.post("/twilio/gather", response_class=Response)
 async def gather(request: Request) -> Response:
-    return Response(continue_call(await _twilio_form(request)), media_type="application/xml")
+    twiml = await run_in_threadpool(continue_call, await _twilio_form(request))
+    return Response(twiml, media_type="application/xml")
+
+
+app.include_router(router)
