@@ -284,7 +284,10 @@ class Agent:
     # So the gate stays exactly this strict and the loop gets bounded instead.
     # The caller cannot escape by being clearer — being clearer makes them reach
     # for 不用 — so the exit has to be offered, then taken by a human.
-    ESCAPE_HATCH = "不好意思，怕我聽錯，麻煩您直接說「確認」或是「取消」。"
+    # 換一個 rather than 取消: 取消 already means "cancel my existing
+    # appointment", and overloading it left call state as the only thing
+    # between a declined proposal and a real cancellation. Both pass the veto.
+    ESCAPE_HATCH = "不好意思，怕我聽錯，麻煩您直接說「確認」或是「換一個」。"
     MAX_REFUSALS = 3
 
     def _refuse(self, hint: str) -> dict:
@@ -304,10 +307,33 @@ class Agent:
         return {"confirmed": False, "hint": hint}
 
     def _looks_like_readback(self, text: str) -> bool:
-        """A read-back names the doctor and says the time out loud."""
+        """A read-back names the doctor and says the hour out loud.
+
+        Deliberately tolerant of paraphrase. Requiring speak_time's exact
+        string meant a model saying 「下午三點」 instead of 「下午3點整」 would be
+        judged not to have read anything back, and confirm would then be
+        refused against a caller who plainly did hear one. That fails closed
+        and silently — the same class of fault as a bound that unbinds itself.
+
+        Tolerance is safe here because this is not the gate. The gate is the
+        veto plus CONFIRMING plus the caller having spoken since. This only
+        answers "did we say the thing out loud", and over-strictness costs more
+        than it buys.
+        """
         if not (self.draft.doctor_name and self.draft.starts_at):
             return False
-        return self.draft.doctor_name in text and speak_time(self.draft.starts_at) in text
+        if self.draft.doctor_name not in text:
+            return False
+        return any(token in text for token in self._hour_tokens(self.draft.starts_at))
+
+    @staticmethod
+    def _hour_tokens(starts_at: str) -> set[str]:
+        """Every plausible spoken spelling of the hour, Arabic and Chinese."""
+        cn = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
+              "十一", "十二"]
+        dt = datetime.fromisoformat(starts_at)
+        twelve = dt.hour - 12 if dt.hour > 12 else (12 if dt.hour == 0 else dt.hour)
+        return {f"{dt.hour}點", f"{twelve}點", f"{cn[twelve]}點"}
 
     # -- bookkeeping -------------------------------------------------------
 
@@ -420,7 +446,10 @@ class ScriptedDriver:
         # 取消 at the escape hatch means "drop this booking", not "cancel my
         # existing appointment" — the same word, two intents, disambiguated by
         # where in the call we are.
-        if re.search(r"取消", said) and agent.state is State.CONFIRMING:
+        # 換一個 is what the escape hatch now asks for. 取消 stays as a backstop
+        # because callers will say it at that prompt regardless of what we ask,
+        # and there it must still mean decline-this-slot.
+        if re.search(r"(換一個|換個|取消)", said) and agent.state is State.CONFIRMING:
             draft.slot_id = draft.doctor_name = draft.starts_at = None
             draft.confirmed = False
             agent._confirm_refusals = 0
