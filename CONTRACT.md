@@ -59,6 +59,12 @@ Idempotent on `call_id`: the same `call_id` twice returns the first result
 rather than booking twice. If the slot was taken in the meantime, returns
 `409` with code `SLOT_TAKEN` — the agent must offer alternatives, not fail.
 
+A stale `slot_id` pointing at a time that has already passed returns `409`
+`SLOT_IN_PAST`. This is deliberately **not** folded into `SLOT_TAKEN`: both
+recover the same way, by re-querying and offering alternatives, but the agent
+must not tell a caller their slot was booked by someone else when it merely
+expired. Saying something false to the caller is worse than an extra code.
+
 ### `reschedule`
 `POST /reschedule` → `{call_id, appointment_id, new_slot_id}`
 → `{appointment_id, starts_at, doctor_name, status: "BOOKED"}`
