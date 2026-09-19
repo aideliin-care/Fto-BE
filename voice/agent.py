@@ -80,6 +80,8 @@ class Agent:
         self._last_said: str | None = None
         self._last_readback: str | None = None
         self._spoke_since_readback = False
+        self._confirm_refusals = 0
+        self._readback_slot: str | None = None
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -117,6 +119,7 @@ class Agent:
             self._spoke_since_readback = True
         if self._is_revision(said):
             self.draft.confirmed = False
+            self._confirm_refusals = 0  # new proposal, new patience
 
         reply = self.driver.respond(self, said)
         if self.state is State.HANDOFF:
@@ -269,9 +272,35 @@ class Agent:
             )
 
         self.draft.confirmed = True
+        self._confirm_refusals = 0
         return {"confirmed": True, "quote": quote}
 
+    # The veto is strict on purpose, and strictness without a bound is a trap:
+    # 「不用改了」 means "leave it as it is" — an affirmation carrying a negation
+    # particle, and a common one on the phone. Blanket 不 vetoes it. Carving out
+    # 不用 would reopen 「那個時間我不太可以」 by another door, since refusals
+    # containing a stray 可以 are unenumerable.
+    #
+    # So the gate stays exactly this strict and the loop gets bounded instead.
+    # The caller cannot escape by being clearer — being clearer makes them reach
+    # for 不用 — so the exit has to be offered, then taken by a human.
+    ESCAPE_HATCH = "不好意思，怕我聽錯，麻煩您直接說「確認」或是「取消」。"
+    MAX_REFUSALS = 3
+
     def _refuse(self, hint: str) -> dict:
+        self._confirm_refusals += 1
+
+        if self._confirm_refusals >= self.MAX_REFUSALS:
+            # A person takes a booking the agent could hear but not certify.
+            result = self._handoff("confirmation_loop")
+            result["hint"] = "已經確認不了三次，請向來電者致歉並轉接櫃檯人員。"
+            return result
+
+        if self._confirm_refusals >= self.MAX_REFUSALS - 1:
+            # A closed question the veto cannot eat: 確認 and 取消 contain no
+            # vetoed token, so a cooperative caller always has a way out.
+            return {"confirmed": False, "hint": hint, "escape_hatch": self.ESCAPE_HATCH}
+
         return {"confirmed": False, "hint": hint}
 
     def _looks_like_readback(self, text: str) -> bool:
@@ -295,6 +324,12 @@ class Agent:
         if self._looks_like_readback(text):
             self._last_readback = text
             self._spoke_since_readback = False
+            # Patience resets only for a read-back of a DIFFERENT slot. A re-ask
+            # names the same doctor and time, so keying on the wording would
+            # reset the counter every turn and remove the bound entirely.
+            if self._readback_slot != self.draft.slot_id:
+                self._readback_slot = self.draft.slot_id
+                self._confirm_refusals = 0
         return text
 
     def _note_system(self, note: str) -> None:
@@ -382,6 +417,16 @@ class ScriptedDriver:
             agent.call_tool("handoff", {"reason": "clinical or human request"})
             return agent.HANDOFF_LINE
 
+        # 取消 at the escape hatch means "drop this booking", not "cancel my
+        # existing appointment" — the same word, two intents, disambiguated by
+        # where in the call we are.
+        if re.search(r"取消", said) and agent.state is State.CONFIRMING:
+            draft.slot_id = draft.doctor_name = draft.starts_at = None
+            draft.confirmed = False
+            agent._confirm_refusals = 0
+            agent.state = State.COLLECTING
+            return "好的，那這個時段先不約。請問您想約什麼時候呢？"
+
         if re.search(r"取消", said):
             draft.intent = "cancel"
             if not draft.appointment_id:
@@ -416,6 +461,10 @@ class ScriptedDriver:
         if agent.state is State.CONFIRMING and not draft.confirmed:
             verdict = agent.call_tool("confirm", {"quote": said})
             if not verdict.get("confirmed"):
+                if verdict.get("handoff"):
+                    return agent.HANDOFF_LINE
+                if verdict.get("escape_hatch"):
+                    return verdict["escape_hatch"]
                 return f"不好意思，想跟您確認一下：{draft.doctor_name}醫師，" \
                        f"{speak_time(draft.starts_at)}，這樣可以嗎？"
 
