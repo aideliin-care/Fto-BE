@@ -115,7 +115,7 @@ async def _twilio_form(request: Request) -> dict[str, str]:
     token = os.environ.get("TWILIO_AUTH_TOKEN")
     base_url = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
     signature = request.headers.get("X-Twilio-Signature", "")
-    url = f"{base_url}{request.url.path}"
+    url = f"{base_url}{request.url.path}" + (f"?{request.url.query}" if request.url.query else "")
     if not token or not base_url or not valid_signature(url, form, signature, token):
         raise HTTPException(status_code=403, detail="invalid Twilio webhook signature")
     return form

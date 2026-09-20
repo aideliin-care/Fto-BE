@@ -1,7 +1,11 @@
+import asyncio
 import os
 import unittest
+from urllib.parse import urlencode
 from unittest.mock import patch
 from xml.etree import ElementTree as ET
+
+from starlette.requests import Request
 
 import telephony
 from agent import State
@@ -62,6 +66,28 @@ class TelephonyTest(unittest.TestCase):
         signature = telephony.twilio_signature(url, form, "secret")
         self.assertTrue(telephony.valid_signature(url, form, signature, "secret"))
         self.assertFalse(telephony.valid_signature(url, {**form, "From": "changed"}, signature, "secret"))
+
+    def test_signature_accepts_webhook_query_string(self):
+        form = {"CallSid": "CA5", "From": "+886900000000"}
+        url = "https://example.test/twilio/voice?source=phone"
+        signature = telephony.twilio_signature(url, form, "secret")
+        body = urlencode(form).encode()
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/twilio/voice",
+                "query_string": b"source=phone",
+                "headers": [(b"x-twilio-signature", signature.encode())],
+            },
+            receive,
+        )
+        with patch.dict(os.environ, {"TWILIO_AUTH_TOKEN": "secret", "PUBLIC_BASE_URL": "https://example.test"}):
+            self.assertEqual(asyncio.run(telephony._twilio_form(request)), form)
 
 
 if __name__ == "__main__":
