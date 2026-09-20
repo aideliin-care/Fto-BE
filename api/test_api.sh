@@ -12,6 +12,7 @@ set -uo pipefail
 API=${API:-http://127.0.0.1:8787}
 PHONE=${PHONE:-0912$RANDOM$RANDOM}
 CALL=${CALL:-call-$RANDOM}
+DB_PATH=${CLINIC_DB_PATH:-clinic.db}
 FAIL=0
 
 post() { curl -s --max-time 10 -X POST "$API/$1" \
@@ -141,11 +142,10 @@ is "bad body is BAD_JSON" "$(get "$R" error code)" "BAD_JSON"
 
 echo
 echo "== 16. notification rows, written by the database trigger =="
-python3 - "$APPT" <<'PY'
-import sqlite3, sys, pathlib
+python3 - "$APPT" "$DB_PATH" <<'PY'
+import sqlite3, sys
 appt = sys.argv[1]
-conn = sqlite3.connect(pathlib.Path(__file__).parent / "clinic.db"
-                       if "__file__" in dir() else "clinic.db")
+conn = sqlite3.connect(sys.argv[2])
 conn.row_factory = sqlite3.Row
 rows = conn.execute(
     "SELECT n.event, ps.starts_at AS moved_from, s.starts_at AS at "

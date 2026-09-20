@@ -19,21 +19,37 @@ import logging
 import os
 import sqlite3
 import uuid
+from base64 import urlsafe_b64decode, urlsafe_b64encode
+from binascii import Error as Base64Error
 from contextlib import contextmanager
 from datetime import datetime
+import json
 from pathlib import Path
-from typing import Optional
+from secrets import compare_digest
+from typing import Literal, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 DB_PATH = Path(os.environ.get("CLINIC_DB_PATH", Path(__file__).parent / "clinic.db"))
 TZ = ZoneInfo("Asia/Taipei")
+CORS_ORIGINS = [origin.strip() for origin in os.environ.get(
+    "CORS_ORIGINS", "http://localhost:5173"
+).split(",") if origin.strip()]
+DASHBOARD_API_KEY = os.environ.get("DASHBOARD_API_KEY")
 
 app = FastAPI(title="Appointment Service", version="1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Dashboard-Key"],
+)
 
 
 # ---------------------------------------------------------------- plumbing
@@ -193,6 +209,34 @@ class CancelOut(BaseModel):
     status: str
 
 
+class DashboardPatient(BaseModel):
+    id: str
+    name: str
+    phone: str
+
+
+class DashboardDoctor(BaseModel):
+    id: str
+    name: str
+    department: str
+
+
+class DashboardReservation(BaseModel):
+    appointment_id: str
+    status: Literal["BOOKED", "CANCELLED"]
+    patient: DashboardPatient
+    doctor: DashboardDoctor
+    starts_at: str
+    ends_at: str
+    created_at: str
+    updated_at: str
+
+
+class DashboardReservationsOut(BaseModel):
+    items: list[DashboardReservation]
+    next_cursor: Optional[str] = None
+
+
 # ---------------------------------------------------------------- helpers
 
 BOOKING_SELECT = """
@@ -244,6 +288,44 @@ def resolve_conflict(conn: sqlite3.Connection,
     raise exc
 
 
+def dashboard_access(x_dashboard_key: Optional[str] = Header(default=None)) -> None:
+    if not DASHBOARD_API_KEY:
+        raise ApiError(503, "DASHBOARD_DISABLED", "Dashboard access is not configured.")
+    if not x_dashboard_key or not compare_digest(x_dashboard_key, DASHBOARD_API_KEY):
+        raise ApiError(403, "DASHBOARD_FORBIDDEN", "Invalid dashboard API key.")
+
+
+def dashboard_time(value: Optional[str], field: str) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError as exc:
+        raise ApiError(400, "BAD_REQUEST", f"{field} must be RFC3339.") from exc
+    if parsed.tzinfo is None:
+        raise ApiError(400, "BAD_REQUEST", f"{field} must include a timezone.")
+    return parsed.astimezone(TZ).isoformat()
+
+
+def decode_cursor(cursor: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    if cursor is None:
+        return None, None
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        starts_at, appointment_id = json.loads(urlsafe_b64decode(padded.encode()).decode())
+        if not isinstance(starts_at, str) or not isinstance(appointment_id, str):
+            raise ValueError
+        dashboard_time(starts_at, "cursor")
+        return starts_at, appointment_id
+    except (Base64Error, ValueError, UnicodeDecodeError) as exc:
+        raise ApiError(400, "BAD_REQUEST", "cursor is invalid.") from exc
+
+
+def encode_cursor(starts_at: str, appointment_id: str) -> str:
+    payload = json.dumps([starts_at, appointment_id], separators=(",", ":")).encode()
+    return urlsafe_b64encode(payload).decode().rstrip("=")
+
+
 # ---------------------------------------------------------------- endpoints
 
 @app.get("/health")
@@ -259,6 +341,72 @@ def health() -> dict:
         return {"ok": True, "now": now_iso(), "slots": slots, "free": free}
     finally:
         conn.close()
+
+
+@app.get("/dashboard/reservations", response_model=DashboardReservationsOut,
+         summary="List reservations for the dashboard",
+         responses={403: {"description": "Invalid dashboard API key."},
+                    503: {"description": "Dashboard access is not configured."}})
+def dashboard_reservations(
+    from_: Optional[str] = Query(default=None, alias="from"),
+    to: Optional[str] = None,
+    status: Optional[Literal["BOOKED", "CANCELLED"]] = None,
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: Optional[str] = None,
+    _access: None = Depends(dashboard_access),
+) -> DashboardReservationsOut:
+    """Read-only, stable cursor pagination over all booking history."""
+    from_at = dashboard_time(from_, "from")
+    to_at = dashboard_time(to, "to")
+    if from_at and to_at and from_at > to_at:
+        raise ApiError(400, "BAD_REQUEST", "from must not be after to.")
+    cursor_start, cursor_appointment = decode_cursor(cursor)
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT a.id AS appointment_id, a.status, a.created_at, a.updated_at,
+                   p.id AS patient_id, p.name AS patient_name, p.phone,
+                   d.id AS doctor_id, d.name AS doctor_name, d.department,
+                   s.starts_at, s.ends_at
+            FROM appointment a
+            JOIN patient p ON p.id = a.patient_id
+            JOIN slot s ON s.id = a.slot_id
+            JOIN doctor d ON d.id = s.doctor_id
+            WHERE (:from_at IS NULL OR s.starts_at >= :from_at)
+              AND (:to_at IS NULL OR s.starts_at <= :to_at)
+              AND (:status IS NULL OR a.status = :status)
+              AND (:cursor_start IS NULL OR s.starts_at > :cursor_start
+                   OR (s.starts_at = :cursor_start AND a.id > :cursor_appointment))
+            ORDER BY s.starts_at, a.id
+            LIMIT :limit
+            """,
+            {
+                "from_at": from_at,
+                "to_at": to_at,
+                "status": status,
+                "cursor_start": cursor_start,
+                "cursor_appointment": cursor_appointment,
+                "limit": limit + 1,
+            },
+        ).fetchall()
+    finally:
+        conn.close()
+
+    has_next = len(rows) > limit
+    rows = rows[:limit]
+    items = [DashboardReservation(
+        appointment_id=row["appointment_id"], status=row["status"],
+        patient=DashboardPatient(id=row["patient_id"], name=row["patient_name"],
+                                 phone=row["phone"]),
+        doctor=DashboardDoctor(id=row["doctor_id"], name=row["doctor_name"],
+                               department=row["department"]),
+        starts_at=row["starts_at"], ends_at=row["ends_at"],
+        created_at=row["created_at"], updated_at=row["updated_at"],
+    ) for row in rows]
+    next_cursor = encode_cursor(rows[-1]["starts_at"], rows[-1]["appointment_id"]) \
+        if has_next else None
+    return DashboardReservationsOut(items=items, next_cursor=next_cursor)
 
 
 @app.post("/lookup_patient", response_model=LookupOut)
