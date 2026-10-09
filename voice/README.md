@@ -34,3 +34,16 @@ Run the adapter unit test from `voice/` with `python3 -m unittest -v test_teleph
 Railway starts the root `app:app`, which serves both the appointment API and
 Twilio routes on its assigned `$PORT`. Attach a Railway Volume at `/data` and
 set `CLINIC_DB_PATH=/data/clinic.db` before storing real appointments.
+
+## Web chat (no phone)
+
+The same agent, typed in a browser. No Twilio variables needed; without
+`OPENAI_API_KEY` it uses the scripted driver and still books real rows.
+
+```zsh
+cd fto-be
+python3 -m uvicorn app:app --port 8787
+open http://127.0.0.1:8787/chat
+```
+
+Run its unit test from `voice/` with `python3 -m unittest -v test_web_chat`.
