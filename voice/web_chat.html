@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>診所文字預約</title>
+<style>
+  :root { --bg: #f5f5f4; --panel: #fff; --ink: #1c1917; --muted: #78716c; --line: #e7e5e4;
+          --me: #0f766e; --me-ink: #fff; --them: #f5f5f4; --ok: #15803d; --warn: #b45309; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 16px/1.5 system-ui, -apple-system, "PingFang TC", "Noto Sans TC", sans-serif; }
+  main { max-width: 560px; margin: 0 auto; height: 100dvh; display: flex; flex-direction: column;
+         background: var(--panel); border-inline: 1px solid var(--line); }
+  header { padding: 12px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
+  header h1 { font-size: 17px; margin: 0 auto 0 0; }
+  input, button { font: inherit; padding: 8px 12px; border-radius: 8px; border: 1px solid var(--line); }
+  button { background: var(--me); color: var(--me-ink); border-color: var(--me); cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #phone { width: 130px; }
+  #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+  .msg { max-width: 80%; padding: 8px 12px; border-radius: 14px; white-space: pre-wrap; }
+  .them { background: var(--them); align-self: flex-start; }
+  .me { background: var(--me); color: var(--me-ink); align-self: flex-end; }
+  .note { align-self: center; color: var(--muted); font-size: 14px; }
+  .note.ok { color: var(--ok); } .note.warn { color: var(--warn); }
+  form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
+  #text { flex: 1; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>診所文字預約</h1>
+    <input id="phone" value="0987000111" aria-label="來電號碼">
+    <button id="restart" type="button">開始</button>
+  </header>
+  <div id="log" aria-live="polite"></div>
+  <form id="send">
+    <input id="text" placeholder="例如：我要掛號，小兒科" autocomplete="off" disabled>
+    <button disabled>送出</button>
+  </form>
+</main>
+<script>
+  const log = document.getElementById("log");
+  const text = document.getElementById("text");
+  const sendButton = document.querySelector("#send button");
+  let sessionId = null;
+
+  function add(cls, content) {
+    const div = document.createElement("div");
+    div.className = cls;
+    div.textContent = content;
+    log.append(div);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function setOpen(open) {
+    text.disabled = sendButton.disabled = !open;
+    if (open) text.focus();
+  }
+
+  async function post(path, body) {
+    const response = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error?.message || data.detail || "系統錯誤");
+    return data;
+  }
+
+  function handle(data) {
+    sessionId = data.session_id;
+    add("msg them", data.reply);
+    if (data.state === "COMMITTED") {
+      add("note ok", data.appointment_id ? `預約完成，編號 ${data.appointment_id}` : "對話完成");
+    } else if (data.state === "HANDOFF") {
+      add("note warn", "已轉接櫃檯人員");
+    } else {
+      setOpen(true);
+      return;
+    }
+    sessionId = null;
+    setOpen(false);
+  }
+
+  async function start() {
+    log.replaceChildren();
+    setOpen(false);
+    add("note", `來電號碼 ${document.getElementById("phone").value}`);
+    try {
+      handle(await post("chat/start", { phone: document.getElementById("phone").value }));
+    } catch (error) {
+      add("note warn", error.message);
+    }
+  }
+
+  document.getElementById("restart").addEventListener("click", start);
+  document.getElementById("send").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const said = text.value.trim();
+    if (!said || !sessionId) return;
+    text.value = "";
+    add("msg me", said);
+    setOpen(false);
+    try {
+      handle(await post("chat/message", { session_id: sessionId, text: said }));
+    } catch (error) {
+      add("note warn", error.message);
+      sessionId = null;
+    }
+  });
+</script>
+</body>
+</html>
