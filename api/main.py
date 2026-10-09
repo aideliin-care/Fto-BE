@@ -42,7 +42,16 @@ CORS_ORIGINS = [origin.strip() for origin in os.environ.get(
 ).split(",") if origin.strip()]
 DASHBOARD_API_KEY = os.environ.get("DASHBOARD_API_KEY")
 
-app = FastAPI(title="Appointment Service", version="1.0")
+app = FastAPI(
+    title="Appointment Service",
+    version="1.0",
+    description=(
+        "Workstream B of CONTRACT.md. The five tools the voice agent calls.\n\n"
+        "Every error is `{\"error\": {\"code\", \"message\"}}`. "
+        "`SLOT_TAKEN` and `SLOT_IN_PAST` both mean re-query and offer "
+        "alternatives, but only `SLOT_TAKEN` means somebody else has it."
+    ),
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
@@ -50,6 +59,24 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type", "X-Dashboard-Key"],
 )
+
+
+def _openapi() -> dict:
+    """Drop FastAPI's automatic 422: validation failures are returned as 400
+    by the handler above, so advertising 422 would misdocument the service."""
+    from fastapi.openapi.utils import get_openapi
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(title=app.title, version=app.version,
+                         description=app.description, routes=app.routes)
+    for path in schema.get("paths", {}).values():
+        for op in path.values():
+            op.get("responses", {}).pop("422", None)
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _openapi
 
 
 # ---------------------------------------------------------------- plumbing
@@ -209,6 +236,15 @@ class CancelOut(BaseModel):
     status: str
 
 
+class ErrorBody(BaseModel):
+    code: str
+    message: str
+
+
+class ErrorResponse(BaseModel):
+    error: ErrorBody
+
+
 class DashboardPatient(BaseModel):
     id: str
     name: str
@@ -235,6 +271,30 @@ class DashboardReservation(BaseModel):
 class DashboardReservationsOut(BaseModel):
     items: list[DashboardReservation]
     next_cursor: Optional[str] = None
+
+
+def errors(*specs: tuple[int, str, str]) -> dict:
+    """Document the error codes an endpoint can actually return.
+
+    FastAPI otherwise advertises only a 422 that this service never sends,
+    and says nothing about SLOT_TAKEN, which is the one error the voice agent
+    has to recover from. Several codes can share a status, so they merge.
+    """
+    out: dict[int, dict] = {}
+    for status, code, desc in specs:
+        entry = out.setdefault(status, {"model": ErrorResponse, "description": ""})
+        sep = "<br>" if entry["description"] else ""
+        entry["description"] += f"{sep}`{code}` — {desc}"
+    return out
+
+
+E_FIELD = (400, "MISSING_FIELD", "a required field is absent or empty")
+E_JSON = (400, "BAD_JSON", "the body is not valid JSON")
+E_SLOT_404 = (404, "SLOT_NOT_FOUND", "no slot with that id")
+E_APPT_404 = (404, "APPOINTMENT_NOT_FOUND", "no appointment with that id")
+E_TAKEN = (409, "SLOT_TAKEN", "someone else holds that slot; offer alternatives")
+E_PAST = (409, "SLOT_IN_PAST", "that time has already passed; re-query")
+E_INTERNAL = (500, "INTERNAL", "unexpected server error")
 
 
 # ---------------------------------------------------------------- helpers
@@ -328,7 +388,7 @@ def encode_cursor(starts_at: str, appointment_id: str) -> str:
 
 # ---------------------------------------------------------------- endpoints
 
-@app.get("/health")
+@app.get("/health", summary="Liveness plus slot counts")
 def health() -> dict:
     conn = connect()
     try:
@@ -409,7 +469,9 @@ def dashboard_reservations(
     return DashboardReservationsOut(items=items, next_cursor=next_cursor)
 
 
-@app.post("/lookup_patient", response_model=LookupOut)
+@app.post("/lookup_patient", response_model=LookupOut,
+          summary="Resolve a caller ID to a patient",
+          responses=errors(E_FIELD, E_JSON, E_INTERNAL))
 def lookup_patient(body: LookupIn) -> LookupOut:
     """Called first on every inbound call, with the caller ID. A miss is a
     normal outcome, not an error: most callers have no row until they book."""
@@ -442,7 +504,9 @@ def lookup_patient(body: LookupIn) -> LookupOut:
         conn.close()
 
 
-@app.post("/find_slots", response_model=FindSlotsOut)
+@app.post("/find_slots", response_model=FindSlotsOut,
+          summary="List free, future slots",
+          responses=errors(E_FIELD, E_JSON, E_INTERNAL))
 def find_slots(body: FindSlotsIn) -> FindSlotsOut:
     """Free, future slots only. doctor_name is matched as a substring, which
     is a superset of the stub's exact match: anything that worked there still
@@ -479,7 +543,10 @@ def find_slots(body: FindSlotsIn) -> FindSlotsOut:
         conn.close()
 
 
-@app.post("/book", response_model=BookingOut)
+@app.post("/book", response_model=BookingOut,
+          summary="Claim a slot; idempotent on call_id",
+          responses=errors(E_FIELD, E_JSON, E_SLOT_404,
+                           E_TAKEN, E_PAST, E_INTERNAL))
 def book(body: BookIn) -> BookingOut:
     """Idempotent on call_id: a dropped call that redials with the same
     call_id gets the first booking back rather than a second one."""
@@ -527,7 +594,10 @@ def book(body: BookIn) -> BookingOut:
         return BookingOut(**booking_payload(conn, appointment_id))
 
 
-@app.post("/reschedule", response_model=BookingOut)
+@app.post("/reschedule", response_model=BookingOut,
+          summary="Move a booking to another slot",
+          responses=errors(E_FIELD, E_JSON, E_APPT_404, E_SLOT_404,
+                           E_TAKEN, E_PAST, E_INTERNAL))
 def reschedule(body: RescheduleIn) -> BookingOut:
     """Moving to the slot it already holds is a no-op, not an error.
 
@@ -560,7 +630,9 @@ def reschedule(body: RescheduleIn) -> BookingOut:
         return BookingOut(**booking_payload(conn, appt["id"]))
 
 
-@app.post("/cancel", response_model=CancelOut)
+@app.post("/cancel", response_model=CancelOut,
+          summary="Cancel a booking; safe to repeat",
+          responses=errors(E_FIELD, E_JSON, E_APPT_404, E_INTERNAL))
 def cancel(body: CancelIn) -> CancelOut:
     """Cancelling twice is not an error. The row is kept as history and the
     slot reopens because it drops out of the partial unique index."""
