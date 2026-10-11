@@ -134,6 +134,10 @@ class Agent:
 
         reply = self.driver.respond(self, said)
         if self.state is State.HANDOFF:
+            # Emergency advice must reach the caller before the transfer;
+            # anything else the model said at this point is dropped.
+            if "119" in reply and reply != self.HANDOFF_LINE:
+                return self._say(f"{reply} {self.HANDOFF_LINE}")
             return self._say(self.HANDOFF_LINE)
         return self._say(reply)
 
@@ -475,7 +479,9 @@ class ScriptedDriver:
     def respond(self, agent: "Agent", said: str) -> str:
         draft = agent.draft
 
-        if re.search(r"(症狀|過敏|吃藥|藥物|痛|發燒|真人|專員|櫃檯)", said):
+        # A symptom alone is the reason for the visit — keep booking. Hand off
+        # only on a request for advice, an emergency, or a request for a person.
+        if re.search(r"(吃什麼藥|什麼藥|能不能吃|嚴不嚴重|要不要看|需不需要看|怎麼辦|呼吸困難|昏迷|抽搐|胸口|大量出血|真人|專員|櫃檯)", said):
             agent.call_tool("handoff", {"reason": "clinical or human request"})
             return agent.HANDOFF_LINE
 
