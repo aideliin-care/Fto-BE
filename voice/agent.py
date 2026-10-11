@@ -406,6 +406,8 @@ class OpenAIDriver:
     def __init__(self, model: str | None = None):
         self.api_key = os.environ["OPENAI_API_KEY"]
         self.model = model or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        # Any OpenAI-compatible endpoint, e.g. https://api.cerebras.ai/v1
+        self.base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 
     def greet(self, found: dict) -> str:
         if found.get("found"):
@@ -443,11 +445,13 @@ class OpenAIDriver:
             "temperature": 0.3,
         }).encode()
         request = urllib.request.Request(
-            "https://api.openai.com/v1/chat/completions",
+            f"{self.base_url}/chat/completions",
             data=payload,
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key}",
+                # Cerebras' edge returns 403 to urllib's default User-Agent.
+                "User-Agent": "fto-be/1.0",
             },
         )
         with urllib.request.urlopen(request, timeout=30) as response:
