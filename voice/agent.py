@@ -64,6 +64,11 @@ def _cn_number(n: int) -> str:
     return ("十" if tens == 1 else digits[tens] + "十") + (digits[ones] if ones else "")
 
 
+def _with_spoken(slots: list) -> list:
+    """Attach the spoken time so the model reads it instead of computing it."""
+    return [{**s, "spoken": speak_time(s["starts_at"])} for s in slots]
+
+
 def speak_time(iso: str) -> str:
     """RFC3339 -> something a person can hear. Never read codes aloud."""
     dt = datetime.fromisoformat(iso)
@@ -88,6 +93,7 @@ class Agent:
         self.messages = [{"role": "system", "content": system_prompt()}]
         self.transcript: list[tuple[str, str]] = []
         self.handoff_reason: str | None = None
+        self._committed_by: str | None = None
         self._last_said: str | None = None
         self._last_readback: str | None = None
         self._spoke_since_readback = False
@@ -132,7 +138,12 @@ class Agent:
             self.draft.confirmed = False
             self._confirm_refusals = 0  # new proposal, new patience
 
+        was_committed = self.state is State.COMMITTED
         reply = self.driver.respond(self, said)
+        if self.state is State.COMMITTED and not was_committed:
+            # The result is known exactly, so say it exactly. The model's own
+            # closing line has come back garbled, and TTS would read it out.
+            return self._say(self._commit_line())
         if self.state is State.HANDOFF:
             # Emergency advice must reach the caller before the transfer;
             # anything else the model said at this point is dropped.
@@ -140,6 +151,13 @@ class Agent:
                 return self._say(f"{reply} {self.HANDOFF_LINE}")
             return self._say(self.HANDOFF_LINE)
         return self._say(reply)
+
+    def _commit_line(self) -> str:
+        if self._committed_by == "cancel":
+            return "好的，已經幫您取消了。謝謝您，再見。"
+        verb = "改到" if self._committed_by == "reschedule" else "約好了"
+        return (f"好的，已經幫您{verb}：{self.draft.doctor_name}醫師，"
+                f"{speak_time(self.draft.starts_at)}。謝謝您，再見。")
 
     def handoff_event(self) -> dict | None:
         """What the phone layer acts on: SIP REFER, or bridge to the extension.
@@ -163,6 +181,8 @@ class Agent:
         """Every tool call funnels through here, including the model's."""
         if name == "confirm":
             return self._confirm(args.get("quote", ""))
+        if name == "propose":
+            return self._propose(args.get("slot_id", ""))
 
         if name in WRITE_TOOLS and not self.draft.confirmed:
             # The gate. Refuse rather than write, and say why.
@@ -171,11 +191,21 @@ class Agent:
                 "hint": "來電者還沒有明確確認。請先讀回醫師姓名和完整時間，問對方確認後再送出。",
             }
 
+        # Consent was given to the slot that was read back, not to whatever
+        # slot_id the model sends next.
+        target = {"book": "slot_id", "reschedule": "new_slot_id"}.get(name)
+        if target and args.get(target) != self.draft.slot_id:
+            return {
+                "error": "SLOT_MISMATCH",
+                "hint": "要送出的時段和剛剛讀回、對方確認的不一樣。請用 propose 重新讀回並確認。",
+            }
+
         try:
             if name == "find_slots":
                 self.draft.last_query = dict(args)
                 result = clinic_api.find_slots(**args)
-                self.draft.offered = result.get("slots", [])
+                result["slots"] = _with_spoken(result.get("slots", []))
+                self.draft.offered = result["slots"]
                 self.state = State.COLLECTING
                 return result
 
@@ -216,6 +246,7 @@ class Agent:
                 return result
             return {"error": exc.code, "message": exc.message}
 
+        self._committed_by = name
         self.draft.appointment_id = result.get("appointment_id")
         self.draft.doctor_name = result.get("doctor_name")
         self.draft.starts_at = result.get("starts_at")
@@ -228,7 +259,7 @@ class Agent:
         self.draft.slot_id = None
         self.state = State.RECOVERING
         try:
-            alternatives = clinic_api.find_slots(**self.draft.last_query).get("slots", [])
+            alternatives = _with_spoken(clinic_api.find_slots(**self.draft.last_query).get("slots", []))
         except clinic_api.ApiError:
             alternatives = []
         self.draft.offered = alternatives
@@ -265,6 +296,29 @@ class Agent:
 
     def _is_revision(self, said: str) -> bool:
         return bool(self.REVISE.search(said))
+
+    def _propose(self, slot_id: str) -> dict:
+        """The model names the slot the caller picked; the code holds it.
+
+        Without this only the scripted driver could ever reach CONFIRMING, so
+        every confirm from the real model was refused. The spelled-out time is
+        handed back because the model gets dates and weekdays wrong when it
+        works them out itself.
+        """
+        slot = next((s for s in self.draft.offered if s.get("slot_id") == slot_id), None)
+        if slot is None:
+            return {"error": "UNKNOWN_SLOT", "hint": "這個時段不在剛剛查到的清單裡，請先用 find_slots 查。"}
+        self.draft.slot_id = slot["slot_id"]
+        self.draft.doctor_name = slot["doctor_name"]
+        self.draft.starts_at = slot["starts_at"]
+        self.draft.confirmed = False
+        self.state = State.CONFIRMING
+        return {
+            "proposed": True,
+            "doctor_name": slot["doctor_name"],
+            "spoken": speak_time(slot["starts_at"]),
+            "hint": "照 doctor_name 和 spoken 讀回給對方，問對方要不要確認。日期和禮拜幾照抄，不要自己換算。",
+        }
 
     def _confirm(self, quote: str) -> dict:
         """Called by the model when it judges the caller agreed."""
@@ -337,7 +391,7 @@ class Agent:
         """
         if not (self.draft.doctor_name and self.draft.starts_at):
             return False
-        if self.draft.doctor_name not in text:
+        if not self._names_doctor(text):
             return False
         # Hour alone is not enough. Slots run the same hours every day for a
         # week, so 「禮拜三下午三點」 would satisfy an hour-only check for a
@@ -347,6 +401,15 @@ class Agent:
         # caller too, so requiring a day is honest as well as safe.
         return (any(t in text for t in self._hour_tokens(self.draft.starts_at))
                 and any(t in text for t in self._day_tokens(self.draft.starts_at)))
+
+    def _names_doctor(self, text: str) -> bool:
+        """Full name, or 林醫師 when no other offered doctor shares the surname."""
+        name = self.draft.doctor_name
+        if name in text:
+            return True
+        surname = name[0]
+        others = {s["doctor_name"] for s in self.draft.offered} - {name}
+        return f"{surname}醫師" in text and not any(o.startswith(surname) for o in others)
 
     @staticmethod
     def _hour_tokens(starts_at: str) -> set[str]:
@@ -419,10 +482,10 @@ class OpenAIDriver:
             upcoming = found.get("upcoming") or []
             if upcoming:
                 when = speak_time(upcoming[0]["starts_at"])
-                return (f"{name}您好，這裡是康寧診所。您目前有一筆 {when}、"
+                return (f"{name}您好，這裡是康寧復健科診所。您目前有一筆 {when}、"
                         f"{upcoming[0]['doctor_name']}醫師的預約。請問有什麼可以幫您？")
-            return f"{name}您好，這裡是康寧診所，請問有什麼可以幫您？"
-        return "您好，這裡是康寧診所，請問有什麼可以幫您？"
+            return f"{name}您好，這裡是康寧復健科診所，請問有什麼可以幫您？"
+        return "您好，這裡是康寧復健科診所，請問有什麼可以幫您？"
 
     def respond(self, agent: "Agent", said: str) -> str:
         for _ in range(4):  # bounded tool-call loop
@@ -470,7 +533,7 @@ class ScriptedDriver:
     to prove the wiring, not to hold a conversation.
     """
 
-    DEPARTMENTS = ["小兒科", "家醫科", "皮膚科", "內科", "耳鼻喉科"]
+    DEPARTMENTS = ["復健科"]
     PICK = {"第一": 0, "一": 0, "第二": 1, "二": 1, "第三": 2, "三": 2}
 
     def greet(self, found: dict) -> str:
@@ -481,7 +544,7 @@ class ScriptedDriver:
 
         # A symptom alone is the reason for the visit — keep booking. Hand off
         # only on a request for advice, an emergency, or a request for a person.
-        if re.search(r"(吃什麼藥|什麼藥|能不能吃|嚴不嚴重|要不要看|需不需要看|怎麼辦|呼吸困難|昏迷|抽搐|胸口|大量出血|真人|專員|櫃檯)", said):
+        if re.search(r"(吃什麼藥|什麼藥|能不能吃|做什麼治療|要不要開刀|能不能熱敷|嚴不嚴重|要不要看|需不需要看|怎麼辦|呼吸困難|半邊無力|講話不清楚|胸口|不能動|大量出血|真人|專員|櫃檯)", said):
             agent.call_tool("handoff", {"reason": "clinical or human request"})
             return agent.HANDOFF_LINE
 
