@@ -32,5 +32,25 @@ class SymptomHandoffTest(unittest.TestCase):
         self.assertIs(self.agent.state, State.HANDOFF)
 
 
+class EmergencyDriver:
+    def greet(self, found):
+        return "您好，這裡是康寧診所。"
+
+    def respond(self, agent, said):
+        agent.call_tool("handoff", {"reason": "emergency"})
+        return "這聽起來很緊急，請立刻打 119 或到最近的急診。"
+
+
+class EmergencyHandoffTest(unittest.TestCase):
+    def test_emergency_advice_is_spoken_before_the_transfer(self):
+        with patch.object(clinic_api, "lookup_patient", return_value={"found": False, "upcoming": []}):
+            agent = Agent(phone="0900000000", driver=EmergencyDriver())
+            agent.answer()
+        reply = agent.turn("我小孩呼吸困難")
+        self.assertIs(agent.state, State.HANDOFF)
+        self.assertIn("119", reply)
+        self.assertIn(Agent.HANDOFF_LINE, reply)
+
+
 if __name__ == "__main__":
     unittest.main()

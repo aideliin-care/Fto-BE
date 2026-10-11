@@ -134,6 +134,10 @@ class Agent:
 
         reply = self.driver.respond(self, said)
         if self.state is State.HANDOFF:
+            # Emergency advice must reach the caller before the transfer;
+            # anything else the model said at this point is dropped.
+            if "119" in reply and reply != self.HANDOFF_LINE:
+                return self._say(f"{reply} {self.HANDOFF_LINE}")
             return self._say(self.HANDOFF_LINE)
         return self._say(reply)
 
