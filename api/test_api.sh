@@ -58,8 +58,8 @@ echo "  slot2 = $SLOT2  ($(get "$R" slots 1 doctor_name), $(get "$R" slots 1 sta
 
 echo
 echo "== 3. find_slots: department filter =="
-R=$(post find_slots '{"department":"皮膚科","limit":2}')
-is "department is 皮膚科" "$(get "$R" slots 0 department)" "皮膚科"
+R=$(post find_slots '{"department":"復健科","limit":2}')
+is "department is 復健科" "$(get "$R" slots 0 department)" "復健科"
 
 echo
 echo "== 4. find_slots: doctor_name matches a partial spoken name =="

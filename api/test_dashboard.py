@@ -18,7 +18,7 @@ class DashboardTest(unittest.TestCase):
         conn = sqlite3.connect(self.db_path)
         conn.executescript((HERE / "schema.sql").read_text())
         conn.executescript("""
-            INSERT INTO doctor VALUES ('doctor-1', '陳柏宏', '皮膚科', 1);
+            INSERT INTO doctor VALUES ('doctor-1', '陳柏宏', '復健科', 1);
             INSERT INTO patient (id, name, phone) VALUES ('patient-1', '王小明', '0912345678');
             INSERT INTO slot VALUES ('slot-1', 'doctor-1', '2030-01-01T09:00:00+08:00', '2030-01-01T09:30:00+08:00');
             INSERT INTO slot VALUES ('slot-2', 'doctor-1', '2030-01-01T10:00:00+08:00', '2030-01-01T10:30:00+08:00');

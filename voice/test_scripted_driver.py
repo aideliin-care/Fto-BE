@@ -20,11 +20,11 @@ class SymptomHandoffTest(unittest.TestCase):
         self.agent.answer()
 
     def test_symptom_with_booking_intent_keeps_booking(self):
-        self.agent.turn("我小孩發燒，想看醫生")
+        self.agent.turn("我肩膀痛，想掛號復健")
         self.assertIsNot(self.agent.state, State.HANDOFF)
 
     def test_asking_for_medical_advice_hands_off(self):
-        self.agent.turn("發燒要吃什麼藥？")
+        self.agent.turn("肩膀痛能不能熱敷？")
         self.assertIs(self.agent.state, State.HANDOFF)
 
     def test_asking_for_a_human_hands_off(self):
@@ -34,7 +34,7 @@ class SymptomHandoffTest(unittest.TestCase):
 
 class EmergencyDriver:
     def greet(self, found):
-        return "您好，這裡是康寧診所。"
+        return "您好，這裡是康寧復健科診所。"
 
     def respond(self, agent, said):
         agent.call_tool("handoff", {"reason": "emergency"})
@@ -46,7 +46,7 @@ class EmergencyHandoffTest(unittest.TestCase):
         with patch.object(clinic_api, "lookup_patient", return_value={"found": False, "upcoming": []}):
             agent = Agent(phone="0900000000", driver=EmergencyDriver())
             agent.answer()
-        reply = agent.turn("我小孩呼吸困難")
+        reply = agent.turn("我爸突然半邊無力")
         self.assertIs(agent.state, State.HANDOFF)
         self.assertIn("119", reply)
         self.assertIn(Agent.HANDOFF_LINE, reply)

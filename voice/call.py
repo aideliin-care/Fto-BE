@@ -16,7 +16,7 @@ import clinic_api
 from agent import Agent, make_driver
 
 DEMO_TURNS = [
-    "我要掛號，小兒科",
+    "我要掛號，復健科",
     "第一個",
     "好，麻煩你",
 ]
