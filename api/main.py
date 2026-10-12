@@ -15,9 +15,12 @@ so swapping this in for the stub is invisible to the voice workstream.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
 import sqlite3
+import time
 import uuid
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from binascii import Error as Base64Error
@@ -41,6 +44,13 @@ CORS_ORIGINS = [origin.strip() for origin in os.environ.get(
     "CORS_ORIGINS", "http://localhost:5173"
 ).split(",") if origin.strip()]
 DASHBOARD_API_KEY = os.environ.get("DASHBOARD_API_KEY")
+# One staff account for the staff frontend. Its tokens are signed with
+# DASHBOARD_API_KEY, so both must be set for login to work.
+STAFF_ID = os.environ.get("STAFF_ID", "staff01")
+STAFF_PASSWORD = os.environ.get("STAFF_PASSWORD")
+STAFF_NAME = os.environ.get("STAFF_NAME", "櫃檯")
+TOKEN_TTL_SECONDS = 12 * 60 * 60
+WEEKDAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]  # doctor_hours: 0 = Sunday
 
 app = FastAPI(
     title="Appointment Service",
@@ -57,7 +67,7 @@ app.add_middleware(
     allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-Dashboard-Key"],
+    allow_headers=["Content-Type", "X-Dashboard-Key", "Authorization"],
 )
 
 
@@ -273,6 +283,54 @@ class DashboardReservationsOut(BaseModel):
     next_cursor: Optional[str] = None
 
 
+class LoginIn(BaseModel):
+    staff_id: str
+    password: str
+
+
+class StaffUser(BaseModel):
+    id: str
+    name: str
+    role: str
+
+
+class LoginOut(BaseModel):
+    token: str
+    user: StaffUser
+
+
+class DashboardDoctorRow(DashboardDoctor):
+    working_days: list[str]
+
+
+class DashboardDoctorsOut(BaseModel):
+    items: list[DashboardDoctorRow]
+
+
+class DashboardPatientRow(DashboardPatient):
+    last_visit: Optional[str] = Field(description="Date of the latest past, uncancelled visit.")
+    primary_doctor_id: Optional[str] = Field(description="The doctor seen most often.")
+    created_at: str
+
+
+class DashboardPatientsOut(BaseModel):
+    items: list[DashboardPatientRow]
+
+
+class DashboardLog(BaseModel):
+    id: int
+    timestamp: str
+    action: Literal["CREATED", "UPDATED", "CANCELLED"]
+    appointment_id: str
+    patient_name: str
+    channel: Literal["agent", "staff"] = Field(
+        description="agent when the booking came through a call or chat, else staff.")
+
+
+class DashboardLogsOut(BaseModel):
+    items: list[DashboardLog]
+
+
 def errors(*specs: tuple[int, str, str]) -> dict:
     """Document the error codes an endpoint can actually return.
 
@@ -348,11 +406,40 @@ def resolve_conflict(conn: sqlite3.Connection,
     raise exc
 
 
-def dashboard_access(x_dashboard_key: Optional[str] = Header(default=None)) -> None:
+def sign(payload: str) -> str:
+    return hmac.new(DASHBOARD_API_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+
+
+def issue_token(staff_id: str) -> str:
+    payload = urlsafe_b64encode(json.dumps(
+        {"sub": staff_id, "exp": int(time.time()) + TOKEN_TTL_SECONDS}).encode()).decode()
+    return f"{payload}.{sign(payload)}"
+
+
+def token_valid(token: str) -> bool:
+    payload, _, signature = token.partition(".")
+    if not signature or not compare_digest(signature, sign(payload)):
+        return False
+    try:
+        claims = json.loads(urlsafe_b64decode(payload.encode()))
+    except (Base64Error, ValueError, UnicodeDecodeError):
+        return False
+    return claims.get("exp", 0) > time.time()
+
+
+def dashboard_access(
+    x_dashboard_key: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> None:
+    """Server callers send the API key; the staff frontend sends a login token."""
     if not DASHBOARD_API_KEY:
         raise ApiError(503, "DASHBOARD_DISABLED", "Dashboard access is not configured.")
-    if not x_dashboard_key or not compare_digest(x_dashboard_key, DASHBOARD_API_KEY):
-        raise ApiError(403, "DASHBOARD_FORBIDDEN", "Invalid dashboard API key.")
+    if x_dashboard_key and compare_digest(x_dashboard_key, DASHBOARD_API_KEY):
+        return
+    scheme, _, token = (authorization or "").partition(" ")
+    if scheme.lower() == "bearer" and token and token_valid(token):
+        return
+    raise ApiError(403, "DASHBOARD_FORBIDDEN", "Invalid dashboard credentials.")
 
 
 def dashboard_time(value: Optional[str], field: str) -> Optional[str]:
@@ -467,6 +554,96 @@ def dashboard_reservations(
     next_cursor = encode_cursor(rows[-1]["starts_at"], rows[-1]["appointment_id"]) \
         if has_next else None
     return DashboardReservationsOut(items=items, next_cursor=next_cursor)
+
+
+@app.post("/auth/login", response_model=LoginOut, summary="Staff login for the dashboard",
+          responses={401: {"description": "`INVALID_LOGIN` — wrong staff id or password."},
+                     503: {"description": "`LOGIN_DISABLED` — staff login is not configured."}})
+def login(body: LoginIn) -> LoginOut:
+    if not (STAFF_PASSWORD and DASHBOARD_API_KEY):
+        raise ApiError(503, "LOGIN_DISABLED", "Staff login is not configured.")
+    if not (compare_digest(body.staff_id, STAFF_ID) and compare_digest(body.password, STAFF_PASSWORD)):
+        raise ApiError(401, "INVALID_LOGIN", "Wrong staff id or password.")
+    return LoginOut(token=issue_token(STAFF_ID),
+                    user=StaffUser(id=STAFF_ID, name=STAFF_NAME, role="reception"))
+
+
+@app.get("/dashboard/doctors", response_model=DashboardDoctorsOut,
+         summary="Doctors and the weekdays they work")
+def dashboard_doctors(_access: None = Depends(dashboard_access)) -> DashboardDoctorsOut:
+    conn = connect()
+    try:
+        doctors = conn.execute(
+            "SELECT id, name, department FROM doctor WHERE active = 1 ORDER BY name").fetchall()
+        hours = conn.execute("SELECT DISTINCT doctor_id, weekday FROM doctor_hours").fetchall()
+    finally:
+        conn.close()
+    days: dict[str, set[int]] = {}
+    for row in hours:
+        days.setdefault(row["doctor_id"], set()).add(row["weekday"])
+    # Monday-first, the way a clinic week reads.
+    order = lambda weekday: (weekday + 6) % 7  # noqa: E731
+    return DashboardDoctorsOut(items=[DashboardDoctorRow(
+        id=d["id"], name=d["name"], department=d["department"],
+        working_days=[WEEKDAYS[w] for w in sorted(days.get(d["id"], ()), key=order)],
+    ) for d in doctors])
+
+
+@app.get("/dashboard/patients", response_model=DashboardPatientsOut,
+         summary="Patients with their last visit and usual doctor")
+def dashboard_patients(_access: None = Depends(dashboard_access)) -> DashboardPatientsOut:
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT p.id, p.name, p.phone, p.created_at,
+                   (SELECT substr(max(s.starts_at), 1, 10)
+                      FROM appointment a JOIN slot s ON s.id = a.slot_id
+                     WHERE a.patient_id = p.id AND a.status = 'BOOKED'
+                       AND s.starts_at < :now) AS last_visit,
+                   (SELECT s.doctor_id
+                      FROM appointment a JOIN slot s ON s.id = a.slot_id
+                     WHERE a.patient_id = p.id AND a.status = 'BOOKED'
+                     GROUP BY s.doctor_id
+                     ORDER BY count(*) DESC, max(s.starts_at) DESC LIMIT 1) AS primary_doctor_id
+            FROM patient p ORDER BY p.name
+            """,
+            {"now": now_iso()},
+        ).fetchall()
+    finally:
+        conn.close()
+    return DashboardPatientsOut(items=[DashboardPatientRow(**dict(row)) for row in rows])
+
+
+@app.get("/dashboard/logs", response_model=DashboardLogsOut,
+         summary="Booking history: created, moved and cancelled, newest first")
+def dashboard_logs(
+    limit: int = Query(default=200, ge=1, le=500),
+    _access: None = Depends(dashboard_access),
+) -> DashboardLogsOut:
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT n.id, n.send_at, n.event, n.appointment_id, p.name AS patient_name,
+                   a.call_id
+            FROM notification n
+            JOIN appointment a ON a.id = n.appointment_id
+            JOIN patient p ON p.id = a.patient_id
+            ORDER BY n.id DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return DashboardLogsOut(items=[DashboardLog(
+        id=row["id"],
+        # send_at is SQLite datetime('now'): UTC, no offset.
+        timestamp=datetime.fromisoformat(row["send_at"] + "+00:00").astimezone(TZ).isoformat(),
+        action=row["event"], appointment_id=row["appointment_id"],
+        patient_name=row["patient_name"],
+        channel="agent" if row["call_id"] else "staff",
+    ) for row in rows])
 
 
 @app.post("/lookup_patient", response_model=LookupOut,
