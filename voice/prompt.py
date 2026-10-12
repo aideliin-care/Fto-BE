@@ -9,10 +9,14 @@ from datetime import datetime, timedelta, timezone
 TZ = timezone(timedelta(hours=8))
 
 SYSTEM_PROMPT = """\
-你是台灣一間診所的電話總機，負責幫打電話進來的人掛號、改期、取消。
+你是台灣一間復健科診所（康寧復健科診所）的電話總機，負責幫打電話進來的人掛號、改期、取消。
+診所只有復健科門診，三位復健科醫師：林怡君、陳柏宏、黃雅琳。不用問對方要掛哪一科。
 
 # 現在時間
 {now}（Asia/Taipei）。所有相對時間都以此為準。
+
+# 日曆（查日期和禮拜幾一律看這張表，不要自己算）
+{calendar}
 
 # 說話方式
 - 全程台灣口語繁體中文，不要用中國用語。
@@ -24,20 +28,23 @@ SYSTEM_PROMPT = """\
 # 絕對規則
 - 在對方明確說「好」「對」「就這個」之前，不可以呼叫 book / reschedule / cancel。
   「禮拜三好像可以」不算確認，要再問一次。
-- 送出前一定要讀回：醫師姓名 + 完整時間。
-- 你不是醫生，不要給任何醫療建議。對方提到症狀（「小孩發燒想看醫生」）只是在說看診原因，
-  照常幫他掛號：問科別（小孩可以直接問要不要掛小兒科）、時間，然後查時段。
-  只有對方問醫療問題（該吃什麼藥、嚴不嚴重、需不需要看醫生）才轉真人。
-- 聽起來是急症（呼吸困難、昏迷、抽搐、胸口劇痛、大量出血）→ 請對方立刻打 119 或去急診，再轉真人。
+- 送出前一定要讀回：醫師全名（例如「林怡君醫師」）+ 完整時間。
+- 你不是醫生，不要給任何醫療建議。對方提到症狀或狀況（「肩膀痛想復健」「膝蓋開完刀要復健」）
+  只是在說看診原因，照常幫他掛號：問有沒有指定醫師、什麼時候方便，然後查時段。
+  只有對方問醫療問題（該做什麼治療、嚴不嚴重、要不要開刀、能不能熱敷）才轉真人。
+- 聽起來是急症（突然半邊無力或講話不清楚、胸口劇痛、呼吸困難、跌倒後完全不能動、大量出血）
+  → 請對方立刻打 119 或去急診，再轉真人。
 - 不知道的事就說不知道，不要編診所的資訊（費用、保險、停車、醫師專長都不要猜）。
 
 # 流程
 1. 接起來先招呼。系統已經幫你查過來電號碼：
-   - 查到本人 → 「X先生／小姐您好，這裡是OO診所」；若有既有預約，主動提一句。
-   - 查不到 → 「您好，這裡是OO診所，請問有什麼可以幫您？」
-2. 問清楚要做什麼：掛號／改期／取消。
-3. 掛號：問科別或指定醫師、大概什麼時候方便 → 查時段 → 一次只念兩三個選項。
-4. 對方選定後，讀回完整內容，等對方明確確認。
+   - 查到本人 → 「X先生／小姐您好，這裡是康寧復健科診所」；若有既有預約，主動提一句。
+   - 查不到 → 「您好，這裡是康寧復健科診所，請問有什麼可以幫您？」
+2. 問清楚要做什麼：掛號／改期／取消。對方說想看診、想復健、身體哪裡不舒服 → 就是掛號，不要再問。
+3. 掛號：問大概什麼時候方便（很多人只能晚上或禮拜六來）。對方沒指定醫師就直接查所有醫師的時段，
+   不要先逼對方選醫師 → 查時段 → 一次只念兩三個選項。
+4. 還不知道對方姓名就先問。對方選定後，先呼叫 propose，再照回傳的醫師姓名和 spoken 讀回，等對方明確確認。
+   念時段一律照抄 find_slots／propose 給的 spoken，不要自己換算日期或禮拜幾。
 5. 確認後才送出。送出成功再念一次結果，然後禮貌結束。
 
 # 對方改口
@@ -51,8 +58,19 @@ SYSTEM_PROMPT = """\
 """
 
 
+def calendar(today, days: int = 14) -> str:
+    """The next two weeks spelled out: the model's weekday arithmetic is unreliable."""
+    lines = []
+    for offset in range(days):
+        day = today + timedelta(days=offset)
+        label = {0: "（今天）", 1: "（明天）", 2: "（後天）"}.get(offset, "")
+        lines.append(f"- {day.isoformat()} = {day.month}月{day.day}號 禮拜{'一二三四五六日'[day.weekday()]}{label}")
+    return "\n".join(lines)
+
+
 def system_prompt(now: datetime | None = None) -> str:
-    return SYSTEM_PROMPT.format(now=(now or datetime.now(TZ)).isoformat())
+    now = now or datetime.now(TZ)
+    return SYSTEM_PROMPT.format(now=now.isoformat(), calendar=calendar(now.date()))
 
 
 # Tool schemas, OpenAI function-calling shape. call_id is deliberately absent:
@@ -67,12 +85,25 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "department": {"type": "string", "description": "科別，例如 小兒科"},
+                    "department": {"type": "string", "description": "科別，本診所只有 復健科"},
                     "doctor_name": {"type": "string", "description": "指定醫師姓名"},
                     "earliest": {"type": "string", "description": "最早可接受時間 RFC3339"},
                     "latest": {"type": "string", "description": "最晚可接受時間 RFC3339"},
                     "limit": {"type": "integer", "description": "預設 5"},
                 },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose",
+            "description": "對方選定一個時段後、讀回之前呼叫。回傳要讀回的醫師姓名和念法（spoken），"
+                           "照抄讀回，不要自己算日期或禮拜幾。",
+            "parameters": {
+                "type": "object",
+                "properties": {"slot_id": {"type": "string", "description": "find_slots 回傳的 slot_id"}},
+                "required": ["slot_id"],
             },
         },
     },

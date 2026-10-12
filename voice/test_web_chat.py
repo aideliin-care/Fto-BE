@@ -18,7 +18,7 @@ class FakeAgent:
         self.draft = FakeDraft()
 
     def answer(self):
-        return "您好，這裡是康寧診所。"
+        return "您好，這裡是康寧復健科診所。"
 
     def turn(self, said):
         if said == "轉真人":
@@ -57,7 +57,7 @@ class WebChatTest(unittest.TestCase):
 
     def test_start_greets_and_remembers_session(self):
         body = self.start()
-        self.assertIn("康寧診所", body["reply"])
+        self.assertIn("康寧復健科診所", body["reply"])
         self.assertEqual(body["state"], "INTENT")
         self.assertIn(body["session_id"], web_chat.sessions)
 

@@ -94,7 +94,7 @@ GET /dashboard/reservations?from=2026-09-21T00:00:00%2B08:00&to=2026-09-28T00:00
       "appointment_id": "uuid",
       "status": "BOOKED",
       "patient": { "id": "uuid", "name": "王小明", "phone": "0912345678" },
-      "doctor": { "id": "uuid", "name": "陳柏宏", "department": "皮膚科" },
+      "doctor": { "id": "uuid", "name": "陳柏宏", "department": "復健科" },
       "starts_at": "2026-09-21T09:00:00+08:00",
       "ends_at": "2026-09-21T09:30:00+08:00",
       "created_at": "2026-09-20T14:12:00+08:00",

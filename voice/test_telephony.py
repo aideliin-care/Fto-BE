@@ -18,7 +18,7 @@ class FakeAgent:
         self.state = State.INTENT
 
     def answer(self):
-        return "您好，這裡是康寧診所。"
+        return "您好，這裡是康寧復健科診所。"
 
     def turn(self, said):
         if said == "轉真人":
@@ -44,7 +44,7 @@ class TelephonyTest(unittest.TestCase):
     def test_starts_a_speech_gather_and_remembers_call(self):
         root = ET.fromstring(telephony.start_call({"CallSid": "CA1", "From": "+886900000000"}))
         self.assertEqual(root.find("Gather").attrib["action"], "/twilio/gather")
-        self.assertIn("康寧診所", root.findtext("Gather/Say"))
+        self.assertIn("康寧復健科診所", root.findtext("Gather/Say"))
         self.assertEqual(telephony.sessions["CA1"].call_id, "CA1")
 
     def test_completed_call_says_result_and_hangs_up(self):
