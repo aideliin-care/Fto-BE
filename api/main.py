@@ -325,6 +325,11 @@ class DashboardLog(BaseModel):
     patient_name: str
     channel: Literal["agent", "staff"] = Field(
         description="agent when the booking came through a call or chat, else staff.")
+    doctor_name: str = Field(description="Doctor of the slot this event put the booking in.")
+    starts_at: str = Field(description="The slot as of this event, not as of now: a later "
+                                       "reschedule does not rewrite an earlier entry.")
+    prev_starts_at: str | None = Field(
+        default=None, description="UPDATED only: the slot the booking was moved from.")
 
 
 class DashboardLogsOut(BaseModel):
@@ -626,10 +631,14 @@ def dashboard_logs(
         rows = conn.execute(
             """
             SELECT n.id, n.send_at, n.event, n.appointment_id, p.name AS patient_name,
-                   a.call_id
+                   a.call_id, s.starts_at, d.name AS doctor_name,
+                   prev.starts_at AS prev_starts_at
             FROM notification n
             JOIN appointment a ON a.id = n.appointment_id
             JOIN patient p ON p.id = a.patient_id
+            JOIN slot s ON s.id = n.slot_id
+            JOIN doctor d ON d.id = s.doctor_id
+            LEFT JOIN slot prev ON prev.id = n.prev_slot_id
             ORDER BY n.id DESC LIMIT ?
             """,
             (limit,),
@@ -643,6 +652,8 @@ def dashboard_logs(
         action=row["event"], appointment_id=row["appointment_id"],
         patient_name=row["patient_name"],
         channel="agent" if row["call_id"] else "staff",
+        doctor_name=row["doctor_name"], starts_at=row["starts_at"],
+        prev_starts_at=row["prev_starts_at"],
     ) for row in rows])
 
 

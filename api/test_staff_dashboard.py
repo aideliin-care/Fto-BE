@@ -119,6 +119,25 @@ class StaffDashboardTest(unittest.TestCase):
         self.assertEqual(logs[0]["channel"], "staff")
         created = next(entry for entry in logs if entry["appointment_id"] == "appt-1")
         self.assertEqual(created["channel"], "agent")
+        self.assertEqual(created["starts_at"], "2020-01-01T09:00:00+08:00")
+        self.assertEqual(created["doctor_name"], "陳柏宏")
+        self.assertIsNone(created["prev_starts_at"])
+
+    def test_a_move_logs_both_slots_and_keeps_the_earlier_entry(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO slot VALUES ('future-2', 'doctor-1', "
+                     "'2030-01-01T09:15:00+08:00', '2030-01-01T09:30:00+08:00')")
+        conn.execute("UPDATE appointment SET slot_id = 'future-2' WHERE id = 'appt-2'")
+        conn.commit()
+        conn.close()
+        logs = self.client.get("/dashboard/logs", headers=self.auth()).json()["items"]
+        moved = logs[0]
+        self.assertEqual(moved["action"], "UPDATED")
+        self.assertEqual(moved["starts_at"], "2030-01-01T09:15:00+08:00")
+        self.assertEqual(moved["doctor_name"], "林怡君")
+        self.assertEqual(moved["prev_starts_at"], "2020-02-01T09:00:00+08:00")
+        created = next(e for e in logs if e["appointment_id"] == "appt-2" and e["action"] == "CREATED")
+        self.assertEqual(created["starts_at"], "2020-02-01T09:00:00+08:00")
 
     def test_cors_allows_the_authorization_header(self):
         response = self.client.options("/dashboard/patients", headers={
