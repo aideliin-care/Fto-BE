@@ -26,19 +26,26 @@
   .note.ok { color: var(--ok); } .note.warn { color: var(--warn); }
   form { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
   #text { flex: 1; }
+  .langs { display: flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .langs button { border: 0; border-radius: 0; background: var(--panel); color: var(--muted); padding: 8px 10px; }
+  .langs button[aria-pressed="true"] { background: var(--me); color: var(--me-ink); }
 </style>
 </head>
 <body>
 <main>
   <header>
-    <h1>診所文字預約</h1>
+    <h1 data-t="title">診所文字預約</h1>
+    <div class="langs" role="group" aria-label="Language">
+      <button type="button" data-lang="zh" aria-pressed="true">中文</button>
+      <button type="button" data-lang="en" aria-pressed="false">EN</button>
+    </div>
     <input id="phone" value="0987000111" aria-label="來電號碼">
-    <button id="restart" type="button">開始</button>
+    <button id="restart" type="button" data-t="start">開始</button>
   </header>
   <div id="log" aria-live="polite"></div>
   <form id="send">
     <input id="text" placeholder="例如：我肩膀痛，想掛復健科" autocomplete="off" disabled>
-    <button disabled>送出</button>
+    <button disabled data-t="send">送出</button>
   </form>
 </main>
 <script>
@@ -46,6 +53,39 @@
   const text = document.getElementById("text");
   const sendButton = document.querySelector("#send button");
   let sessionId = null;
+
+  const STRINGS = {
+    zh: { html: "zh-Hant", title: "診所文字預約", start: "開始", send: "送出", phone: "來電號碼",
+          placeholder: "例如：我肩膀痛，想掛復健科", caller: "來電號碼", booked: "預約完成，編號",
+          done: "對話完成", handoff: "已轉接櫃檯人員", error: "系統錯誤",
+          ended: "對話已結束或不存在，請重新開始。", busy: "系統暫時無法服務，請稍後再試。" },
+    en: { html: "en", title: "Clinic Booking Chat", start: "Start", send: "Send", phone: "Caller number",
+          placeholder: "e.g. My shoulder hurts, I'd like to book a session", caller: "Calling from",
+          booked: "Booked, appointment no.", done: "Conversation complete",
+          handoff: "Transferred to the front desk", error: "Something went wrong",
+          ended: "This conversation has ended. Please start again.",
+          busy: "The service is temporarily unavailable. Please try again later." },
+  };
+  const params = new URLSearchParams(location.search);
+  let lang = params.get("lang");
+  if (!STRINGS[lang]) {
+    try { lang = localStorage.getItem("chat-lang"); } catch { lang = null; }
+  }
+  if (!STRINGS[lang]) lang = "zh";
+  const t = (key) => STRINGS[lang][key];
+
+  function applyLang(next) {
+    lang = next;
+    try { localStorage.setItem("chat-lang", lang); } catch {}
+    document.documentElement.lang = t("html");
+    document.title = t("title");
+    document.querySelectorAll("[data-t]").forEach((el) => { el.textContent = t(el.dataset.t); });
+    document.querySelectorAll("[data-lang]").forEach((el) => {
+      el.setAttribute("aria-pressed", String(el.dataset.lang === lang));
+    });
+    document.getElementById("phone").setAttribute("aria-label", t("phone"));
+    text.placeholder = t("placeholder");
+  }
 
   function add(cls, content) {
     const div = document.createElement("div");
@@ -67,7 +107,9 @@
       body: JSON.stringify(body),
     });
     const data = await response.json();
-    if (!response.ok) throw new Error(data.error?.message || data.detail || "系統錯誤");
+    if (response.status === 404) throw new Error(t("ended"));
+    if (response.status === 502) throw new Error(t("busy"));
+    if (!response.ok) throw new Error(t("error"));
     return data;
   }
 
@@ -75,9 +117,9 @@
     sessionId = data.session_id;
     add("msg them", data.reply);
     if (data.state === "COMMITTED") {
-      add("note ok", data.appointment_id ? `預約完成，編號 ${data.appointment_id}` : "對話完成");
+      add("note ok", data.appointment_id ? `${t("booked")} ${data.appointment_id}` : t("done"));
     } else if (data.state === "HANDOFF") {
-      add("note warn", "已轉接櫃檯人員");
+      add("note warn", t("handoff"));
     } else {
       setOpen(true);
       return;
@@ -89,14 +131,22 @@
   async function start() {
     log.replaceChildren();
     setOpen(false);
-    add("note", `來電號碼 ${document.getElementById("phone").value}`);
+    add("note", `${t("caller")} ${document.getElementById("phone").value}`);
     try {
-      handle(await post("chat/start", { phone: document.getElementById("phone").value }));
+      handle(await post("chat/start", { phone: document.getElementById("phone").value, lang }));
     } catch (error) {
       add("note warn", error.message);
     }
   }
 
+  // Switching language mid-conversation starts over: the agent was set up in
+  // the old one and would keep answering in it.
+  document.querySelectorAll("[data-lang]").forEach((el) => el.addEventListener("click", () => {
+    if (el.dataset.lang === lang) return;
+    applyLang(el.dataset.lang);
+    if (sessionId) start();
+  }));
+  applyLang(lang);
   document.getElementById("restart").addEventListener("click", start);
   document.getElementById("send").addEventListener("submit", async (event) => {
     event.preventDefault();

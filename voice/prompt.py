@@ -68,9 +68,45 @@ def calendar(today, days: int = 14) -> str:
     return "\n".join(lines)
 
 
-def system_prompt(now: datetime | None = None) -> str:
+ENGLISH = """
+
+# Language: English (this overrides 說話方式 and every Chinese example above)
+The caller chose English. Speak only natural, concise English, one or two sentences at a time.
+- The clinic is Kangning Rehabilitation Clinic. Its doctors are Dr. Lin Yi-Chun (林怡君),
+  Dr. Chen Po-Hung (陳柏宏) and Dr. Huang Ya-Lin (黃雅琳). Always use these English names.
+- Tool results are partly in Chinese; never repeat Chinese to the caller.
+- Read times exactly as the `spoken` field gives them, and doctors as `doctor_name_en`
+  (or `doctor_name` from propose). Never work out dates or weekdays yourself.
+- Searching: when the caller names a day or part of day, call find_slots with `earliest` and
+  `latest` covering exactly that window, taking the date from the calendar below
+  (e.g. Saturday morning = that Saturday 08:00 to 12:00). Offer two or three options, not a list.
+- Same steps as 流程 above: ask the caller's name, find_slots, and once the caller picks a slot
+  call propose BEFORE reading anything back. Then read back exactly the doctor_name and spoken
+  that propose returned and ask "Shall I book that for you?". Only a plain yes counts.
+- After the yes, call confirm with the caller's exact words FIRST, then book. book without a
+  successful confirm is always refused.
+- Emergencies: tell the caller to call 119 or go to the emergency room right away.
+
+# Calendar in English
+{calendar}
+"""
+
+
+def calendar_en(today, days: int = 14) -> str:
+    lines = []
+    for offset in range(days):
+        day = today + timedelta(days=offset)
+        label = {0: " (today)", 1: " (tomorrow)"}.get(offset, "")
+        lines.append(f"- {day.isoformat()} = {day:%A, %B} {day.day}{label}")
+    return "\n".join(lines)
+
+
+def system_prompt(now: datetime | None = None, lang: str = "zh") -> str:
     now = now or datetime.now(TZ)
-    return SYSTEM_PROMPT.format(now=now.isoformat(), calendar=calendar(now.date()))
+    prompt = SYSTEM_PROMPT.format(now=now.isoformat(), calendar=calendar(now.date()))
+    if lang == "en":
+        prompt += ENGLISH.format(calendar=calendar_en(now.date()))
+    return prompt
 
 
 # Tool schemas, OpenAI function-calling shape. call_id is deliberately absent:

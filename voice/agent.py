@@ -64,14 +64,59 @@ def _cn_number(n: int) -> str:
     return ("十" if tens == 1 else digits[tens] + "十") + (digits[ones] if ones else "")
 
 
-def _with_spoken(slots: list) -> list:
+# Romanised as on Taiwanese passports. The database keeps the Chinese name;
+# an English-speaking caller hears and repeats this one.
+DOCTORS_EN = {"林怡君": "Lin Yi-Chun", "陳柏宏": "Chen Po-Hung", "黃雅琳": "Huang Ya-Lin"}
+WEEKDAYS_EN = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+MONTHS_EN = ["January", "February", "March", "April", "May", "June", "July",
+             "August", "September", "October", "November", "December"]
+
+# What the agent itself says, as opposed to what the model says.
+LINES = {
+    "zh": {
+        "handoff": "這部分我幫您轉接櫃檯人員，請稍等。",
+        "escape_hatch": "不好意思，怕我聽錯，麻煩您直接說「確認」或是「換一個」。",
+        "booked": "好的，已經幫您約好了：{doctor}，{spoken}。謝謝您，再見。",
+        "rescheduled": "好的，已經幫您改到：{doctor}，{spoken}。謝謝您，再見。",
+        "cancelled": "好的，已經幫您取消了。謝謝您，再見。",
+        "pardon": "不好意思，可以再說一次嗎？",
+        "gave_up": "不好意思，我幫您轉接櫃檯人員。",
+    },
+    "en": {
+        "handoff": "Let me transfer you to our front desk. One moment, please.",
+        "escape_hatch": "Sorry, just so I don't get this wrong: please say \"confirm\" or \"another one\".",
+        "booked": "All set. You're booked with {doctor} on {spoken}. Thank you, goodbye.",
+        "rescheduled": "All set. Your appointment is now with {doctor} on {spoken}. Thank you, goodbye.",
+        "cancelled": "All set. Your appointment has been cancelled. Thank you, goodbye.",
+        "pardon": "Sorry, could you say that again?",
+        "gave_up": "Sorry, let me transfer you to our front desk.",
+    },
+}
+
+
+def doctor_title(name: str, lang: str = "zh") -> str:
+    """林怡君醫師, or Dr. Lin Yi-Chun for an English call."""
+    if lang == "en":
+        return f"Dr. {DOCTORS_EN.get(name, name)}"
+    return f"{name}醫師"
+
+
+def _with_spoken(slots: list, lang: str = "zh") -> list:
     """Attach the spoken time so the model reads it instead of computing it."""
+    if lang == "en":
+        return [{**s, "spoken": speak_time(s["starts_at"], "en"),
+                 "doctor_name_en": doctor_title(s["doctor_name"], "en")} for s in slots]
     return [{**s, "spoken": speak_time(s["starts_at"])} for s in slots]
 
 
-def speak_time(iso: str) -> str:
+def speak_time(iso: str, lang: str = "zh") -> str:
     """RFC3339 -> something a person can hear. Never read codes aloud."""
     dt = datetime.fromisoformat(iso)
+    if lang == "en":
+        hour = dt.hour % 12 or 12
+        meridiem = "AM" if dt.hour < 12 else "PM"
+        return (f"{WEEKDAYS_EN[dt.weekday()]}, {MONTHS_EN[dt.month - 1]} {dt.day} "
+                f"at {hour}:{dt.minute:02d} {meridiem}")
     weekday = "一二三四五六日"[dt.weekday()]
     hour, meridiem = dt.hour, "上午"
     if dt.hour >= 12:
@@ -84,13 +129,19 @@ def speak_time(iso: str) -> str:
 class Agent:
     """Drives one call. `turn()` takes what the caller said, returns what to say."""
 
-    def __init__(self, phone: str, driver, call_id: str | None = None):
+    def __init__(self, phone: str, driver, call_id: str | None = None, lang: str = "zh"):
         self.phone = phone
+        self.lang = lang if lang in LINES else "zh"
+        self.lines = LINES[self.lang]
+        self.HANDOFF_LINE = self.lines["handoff"]
+        self.ESCAPE_HATCH = self.lines["escape_hatch"]
+        if self.lang == "en":
+            self.VETO, self.REVISE = self.VETO_EN, self.REVISE_EN
         self.call_id = call_id or f"call-{uuid.uuid4()}"
         self.driver = driver
         self.draft = Draft(phone=phone)
         self.state = State.GREETING
-        self.messages = [{"role": "system", "content": system_prompt()}]
+        self.messages = [{"role": "system", "content": system_prompt(lang=self.lang)}]
         self.transcript: list[tuple[str, str]] = []
         self.handoff_reason: str | None = None
         self._committed_by: str | None = None
@@ -117,7 +168,8 @@ class Agent:
                 self.draft.appointment_id = upcoming[0]["appointment_id"]
         self._note_system(f"caller_id_lookup={json.dumps(found, ensure_ascii=False)}")
         self.state = State.INTENT
-        return self._say(self.driver.greet(found))
+        greeting = greet_en(found) if self.lang == "en" else self.driver.greet(found)
+        return self._say(greeting)
 
     HANDOFF_LINE = "這部分我幫您轉接櫃檯人員，請稍等。"
 
@@ -154,10 +206,10 @@ class Agent:
 
     def _commit_line(self) -> str:
         if self._committed_by == "cancel":
-            return "好的，已經幫您取消了。謝謝您，再見。"
-        verb = "改到" if self._committed_by == "reschedule" else "約好了"
-        return (f"好的，已經幫您{verb}：{self.draft.doctor_name}醫師，"
-                f"{speak_time(self.draft.starts_at)}。謝謝您，再見。")
+            return self.lines["cancelled"]
+        key = "rescheduled" if self._committed_by == "reschedule" else "booked"
+        return self.lines[key].format(doctor=doctor_title(self.draft.doctor_name, self.lang),
+                                      spoken=speak_time(self.draft.starts_at, self.lang))
 
     def handoff_event(self) -> dict | None:
         """What the phone layer acts on: SIP REFER, or bridge to the extension.
@@ -185,11 +237,15 @@ class Agent:
             return self._propose(args.get("slot_id", ""))
 
         if name in WRITE_TOOLS and not self.draft.confirmed:
-            # The gate. Refuse rather than write, and say why.
-            return {
-                "error": "NOT_CONFIRMED",
-                "hint": "來電者還沒有明確確認。請先讀回醫師姓名和完整時間，問對方確認後再送出。",
-            }
+            # The gate. Refuse rather than write, and say why. When the
+            # read-back already happened and the caller answered, the missing
+            # step is confirm itself: a hint that says "read back" again sends
+            # the model round the same loop forever.
+            if self.state is State.CONFIRMING and self._last_readback and self._spoke_since_readback:
+                hint = "還沒有呼叫 confirm。請先呼叫 confirm（quote 填對方的原話），通過後再呼叫一次這個工具。"
+            else:
+                hint = "來電者還沒有明確確認。請先讀回醫師姓名和完整時間，問對方確認後再送出。"
+            return {"error": "NOT_CONFIRMED", "hint": hint}
 
         # Consent was given to the slot that was read back, not to whatever
         # slot_id the model sends next.
@@ -204,7 +260,7 @@ class Agent:
             if name == "find_slots":
                 self.draft.last_query = dict(args)
                 result = clinic_api.find_slots(**args)
-                result["slots"] = _with_spoken(result.get("slots", []))
+                result["slots"] = _with_spoken(result.get("slots", []), self.lang)
                 self.draft.offered = result["slots"]
                 self.state = State.COLLECTING
                 return result
@@ -259,7 +315,8 @@ class Agent:
         self.draft.slot_id = None
         self.state = State.RECOVERING
         try:
-            alternatives = _with_spoken(clinic_api.find_slots(**self.draft.last_query).get("slots", []))
+            alternatives = _with_spoken(clinic_api.find_slots(**self.draft.last_query).get("slots", []),
+                                        self.lang)
         except clinic_api.ApiError:
             alternatives = []
         self.draft.offered = alternatives
@@ -294,6 +351,16 @@ class Agent:
     VETO = re.compile(r"(嗎|呢|吧|但|不過|可是|好像|應該|大概|如果|再想|先問|不|…|\.{3,}|[?？])")
     REVISE = re.compile(r"(不對|不要|改成|換成|等一下|等等|還是|另外|重新)")
 
+    # The same bias in English: any negation or hedge vetoes, so "No problem"
+    # costs one more question rather than "I can't do that time" booking it.
+    VETO_EN = re.compile(
+        r"([?…]|\.{3,}|n't\b|\b(no|not|nope|maybe|perhaps|probably|might|but|though|however|"
+        r"wait|hold on|unless|if|think|guess|hmm+|um+|uh+|actually)\b)",
+        re.IGNORECASE,
+    )
+    REVISE_EN = re.compile(
+        r"\b(actually|instead|change|switch|rather|different|another|wait|hold on)\b", re.IGNORECASE)
+
     def _is_revision(self, said: str) -> bool:
         return bool(self.REVISE.search(said))
 
@@ -315,8 +382,9 @@ class Agent:
         self.state = State.CONFIRMING
         return {
             "proposed": True,
-            "doctor_name": slot["doctor_name"],
-            "spoken": speak_time(slot["starts_at"]),
+            "doctor_name": doctor_title(slot["doctor_name"], self.lang) if self.lang == "en"
+            else slot["doctor_name"],
+            "spoken": speak_time(slot["starts_at"], self.lang),
             "hint": "照 doctor_name 和 spoken 讀回給對方，問對方要不要確認。日期和禮拜幾照抄，不要自己換算。",
         }
 
@@ -393,6 +461,8 @@ class Agent:
             return False
         if not self._names_doctor(text):
             return False
+        if self.lang == "en":
+            return self._says_time_en(text, self.draft.starts_at)
         # Hour alone is not enough. Slots run the same hours every day for a
         # week, so 「禮拜三下午三點」 would satisfy an hour-only check for a
         # Thursday draft: the caller hears Wednesday, says 確認, and book writes
@@ -405,11 +475,38 @@ class Agent:
     def _names_doctor(self, text: str) -> bool:
         """Full name, or 林醫師 when no other offered doctor shares the surname."""
         name = self.draft.doctor_name
+        if self.lang == "en":
+            return self._names_doctor_en(text)
         if name in text:
             return True
         surname = name[0]
         others = {s["doctor_name"] for s in self.draft.offered} - {name}
         return f"{surname}醫師" in text and not any(o.startswith(surname) for o in others)
+
+    def _names_doctor_en(self, text: str) -> bool:
+        """Lin Yi-Chun (hyphen optional), or Dr. Lin when the surname is unambiguous."""
+        said = text.lower()
+        full = DOCTORS_EN.get(self.draft.doctor_name, self.draft.doctor_name).lower()
+        if any(v in said for v in {full, full.replace("-", " "), full.replace("-", "")}):
+            return True
+        surname = full.split()[0]
+        others = {DOCTORS_EN.get(s["doctor_name"], s["doctor_name"]).lower().split()[0]
+                  for s in self.draft.offered if s["doctor_name"] != self.draft.doctor_name}
+        return surname not in others and bool(re.search(rf"\b(dr\.?|doctor)\s+{surname}\b", said))
+
+    @staticmethod
+    def _says_time_en(text: str, starts_at: str) -> bool:
+        """The hour and the day, as 'Saturday' or 'October 17'. Same rule as Chinese."""
+        said = text.lower()
+        dt = datetime.fromisoformat(starts_at)
+        hour = dt.hour % 12 or 12
+        meridiem = "am" if dt.hour < 12 else "pm"
+        says_hour = re.search(
+            rf"\b{hour}(:{dt.minute:02d}\b|\s*{meridiem}\b|\s*o'clock\b)", said)
+        month = MONTHS_EN[dt.month - 1].lower()
+        says_day = (WEEKDAYS_EN[dt.weekday()].lower() in said
+                    or re.search(rf"\b({month}|{month[:3]})\.?\s+{dt.day}(st|nd|rd|th)?\b", said))
+        return bool(says_hour and says_day)
 
     @staticmethod
     def _hour_tokens(starts_at: str) -> set[str]:
@@ -492,7 +589,7 @@ class OpenAIDriver:
             reply = self._chat(agent.messages)
             calls = reply.get("tool_calls")
             if not calls:
-                return reply.get("content") or "不好意思，可以再說一次嗎？"
+                return reply.get("content") or agent.lines["pardon"]
             agent.messages.append(reply)
             for call in calls:
                 args = json.loads(call["function"]["arguments"] or "{}")
@@ -502,7 +599,7 @@ class OpenAIDriver:
                     "tool_call_id": call["id"],
                     "content": json.dumps(result, ensure_ascii=False),
                 })
-        return "不好意思，我幫您轉接櫃檯人員。"
+        return agent.lines["gave_up"]
 
     def _chat(self, messages: list) -> dict:
         payload = json.dumps({
@@ -636,6 +733,19 @@ class ScriptedDriver:
     def _name_from(self, said: str):
         match = re.search(r"我(?:姓|叫|是)\s*([一-龥]{2,4})", said)
         return match.group(1) if match else None
+
+
+def greet_en(found: dict) -> str:
+    """The English greeting. Kept out of the drivers: it is fixed text, not the model's."""
+    hello = "Hello, this is Kangning Rehabilitation Clinic."
+    if found.get("found"):
+        hello = f"Hello {found.get('name', '')}, this is Kangning Rehabilitation Clinic."
+        upcoming = found.get("upcoming") or []
+        if upcoming:
+            return (f"{hello} You have an appointment with "
+                    f"{doctor_title(upcoming[0]['doctor_name'], 'en')} on "
+                    f"{speak_time(upcoming[0]['starts_at'], 'en')}. How can I help you today?")
+    return f"{hello} How can I help you today?"
 
 
 def make_driver():

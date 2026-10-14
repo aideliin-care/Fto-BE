@@ -12,12 +12,15 @@ class FakeDraft:
 
 
 class FakeAgent:
-    def __init__(self, phone, driver):
+    def __init__(self, phone, driver, lang="zh"):
         self.phone = phone
+        self.lang = lang
         self.state = State.INTENT
         self.draft = FakeDraft()
 
     def answer(self):
+        if self.lang == "en":
+            return "Hello, this is Kangning Rehabilitation Clinic."
         return "您好，這裡是康寧復健科診所。"
 
     def turn(self, said):
@@ -60,6 +63,14 @@ class WebChatTest(unittest.TestCase):
         self.assertIn("康寧復健科診所", body["reply"])
         self.assertEqual(body["state"], "INTENT")
         self.assertIn(body["session_id"], web_chat.sessions)
+
+    def test_start_in_english_greets_in_english(self):
+        response = self.client.post("/chat/start", json={"phone": "0987000111", "lang": "en"})
+        self.assertIn("Kangning Rehabilitation Clinic", response.json()["reply"])
+
+    def test_unknown_language_is_rejected(self):
+        response = self.client.post("/chat/start", json={"phone": "0987000111", "lang": "fr"})
+        self.assertEqual(response.status_code, 422)
 
     def test_message_continues_conversation(self):
         session_id = self.start()["session_id"]

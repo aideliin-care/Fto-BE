@@ -13,6 +13,8 @@ from pathlib import Path
 from fastapi import APIRouter, FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse
+from typing import Literal
+
 from pydantic import BaseModel
 
 from agent import Agent, State, make_driver
@@ -26,6 +28,7 @@ ENDED = {State.COMMITTED, State.HANDOFF}
 
 class StartIn(BaseModel):
     phone: str
+    lang: Literal["zh", "en"] = "zh"
 
 
 class MessageIn(BaseModel):
@@ -44,9 +47,9 @@ def _reply(session_id: str, agent: Agent, reply: str) -> dict:
     }
 
 
-def start_chat(phone: str) -> dict:
+def start_chat(phone: str, lang: str = "zh") -> dict:
     session_id = str(uuid.uuid4())
-    agent = Agent(phone=phone, driver=make_driver())
+    agent = Agent(phone=phone, driver=make_driver(), lang=lang)
     sessions[session_id] = agent
     return _reply(session_id, agent, agent.answer())
 
@@ -71,7 +74,7 @@ def page() -> str:
 
 @router.post("/chat/start")
 async def start(body: StartIn) -> dict:
-    return await run_in_threadpool(start_chat, body.phone.strip())
+    return await run_in_threadpool(start_chat, body.phone.strip(), body.lang)
 
 
 @router.post("/chat/message")
