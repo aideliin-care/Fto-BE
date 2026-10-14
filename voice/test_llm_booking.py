@@ -74,6 +74,20 @@ class LlmBookingTest(unittest.TestCase):
         _, driver = self.run_booking(lambda d: f"林怡君醫師，{d.results[-1]['spoken']}，這樣可以嗎？")
         self.assertEqual(driver.results[1]["spoken"], "10月17號 禮拜六 上午8點30分")
 
+    def test_book_without_confirm_is_told_to_call_confirm(self):
+        driver = ToolDriver([
+            ([("find_slots", {"department": "復健科"})], "禮拜六上午有八點半，要嗎？"),
+            ([("propose", {"slot_id": "s1"})], lambda d: f"林怡君醫師，{d.results[-1]['spoken']}，這樣可以嗎？"),
+            ([("book", {"slot_id": "s1", "patient_name": "王小明"})], "好的。"),
+        ])
+        agent = Agent(phone="0900000000", driver=driver)
+        agent.answer()
+        for said in ["禮拜六", "第一個", "好"]:
+            agent.turn(said)
+        self.booked.assert_not_called()
+        self.assertEqual(driver.results[-1]["error"], "NOT_CONFIRMED")
+        self.assertIn("confirm", driver.results[-1]["hint"])
+
     def test_book_refuses_a_slot_other_than_the_one_read_back(self):
         agent, driver = self.run_booking(
             lambda d: f"林怡君醫師，{d.results[-1]['spoken']}，這樣可以嗎？", book_slot="s2")
