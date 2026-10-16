@@ -24,33 +24,37 @@ DB_PATH = Path(os.environ.get("CLINIC_DB_PATH", HERE / "clinic.db"))
 SCHEMA = HERE / "schema.sql"
 TZ = ZoneInfo("Asia/Taipei")
 
+# Little Star Pediatric Clinic's weekly schedule, the one Call_Care_Agent
+# answers questions from (data/clinics/little_star_pediatric_clinic.yaml).
+# A block runs from the session's start to its registration cutoff, not to
+# the end of the session, so the last slot still starts before registration
+# closes.
+MORNING = ("09:00", "11:30")    # session 09:00-12:00
+AFTERNOON = ("15:00", "17:30")  # session 15:00-18:00
+EVENING = ("18:30", "21:00")    # session 18:30-21:30
+
 # name, department, [(weekday, start, end, slot_minutes)]
 # weekday: 0 = Sunday .. 6 = Saturday
 DOCTORS = [
-    # A rehabilitation clinic: one department, with the evening and Saturday
-    # sessions working patients come to after work.
-    ("林怡君", "復健科", [
-        (1, "08:30", "12:00", 15),
-        (2, "08:30", "12:00", 15),
-        (3, "18:30", "21:00", 15),
-        (4, "08:30", "12:00", 15),
-        (5, "18:30", "21:00", 15),
-        (6, "08:30", "12:00", 15),
+    ("林志豪", "小兒科", [
+        (1, *MORNING, 15),
+        (6, *MORNING, 15),
+        (3, *AFTERNOON, 15),
+        (5, *AFTERNOON, 15),
+        (1, *EVENING, 15),
+        (2, *EVENING, 15),
+        (5, *EVENING, 15),
     ]),
-    ("陳柏宏", "復健科", [
-        (1, "14:30", "17:30", 15),
-        (1, "18:30", "21:00", 15),
-        (2, "14:30", "17:30", 15),
-        (3, "08:30", "12:00", 15),
-        (4, "18:30", "21:00", 15),
-        (5, "14:30", "17:30", 15),
-    ]),
-    ("黃雅琳", "復健科", [
-        (2, "18:30", "21:00", 15),
-        (3, "14:30", "17:30", 15),
-        (4, "14:30", "17:30", 15),
-        (5, "08:30", "12:00", 15),
-        (6, "08:30", "12:00", 15),
+    ("陳瑋庭", "小兒科", [
+        (1, *MORNING, 15),
+        (2, *MORNING, 15),
+        (3, *MORNING, 15),
+        (5, *MORNING, 15),
+        (6, *MORNING, 15),
+        (1, *AFTERNOON, 15),
+        (2, *EVENING, 15),
+        (3, *EVENING, 15),
+        (5, *EVENING, 15),
     ]),
 ]
 
@@ -124,12 +128,25 @@ def main() -> None:
             )
         else:
             doctor_id = row["id"]
+            conn.execute(
+                "UPDATE doctor SET department = ?, active = 1 WHERE id = ?",
+                (department, doctor_id),
+            )
         conn.executemany(
             "INSERT OR IGNORE INTO doctor_hours "
             "(doctor_id, weekday, start_time, end_time, slot_minutes) "
             "VALUES (?,?,?,?,?)",
             [(doctor_id, *b) for b in blocks],
         )
+
+    # DOCTORS is the whole roster. A doctor dropped from it is retired, not
+    # deleted, so their appointments stay in the history; find_slots and
+    # generate_slots already skip inactive doctors.
+    names = [name for name, _, _ in DOCTORS]
+    conn.execute(
+        f"UPDATE doctor SET active = 0 WHERE name NOT IN ({','.join('?' * len(names))})",
+        names,
+    )
 
     added = generate_slots(conn, args.days)
     total = conn.execute("SELECT count(*) FROM slot").fetchone()[0]
