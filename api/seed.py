@@ -100,6 +100,15 @@ def generate_slots(conn: sqlite3.Connection, days: int) -> int:
     return after - before
 
 
+def add_missing_columns(conn: sqlite3.Connection) -> None:
+    """CREATE TABLE IF NOT EXISTS leaves a deployed table as it was, so columns added
+    to schema.sql since are added here. This runs on every deploy."""
+    present = {row["name"] for row in conn.execute("PRAGMA table_info(appointment)")}
+    for column in ("visit_name", "visit_birth_date"):
+        if column not in present:
+            conn.execute(f"ALTER TABLE appointment ADD COLUMN {column} TEXT")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=30)
@@ -116,6 +125,7 @@ def main() -> None:
     conn = sqlite3.connect(DB_PATH, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA.read_text())
+    add_missing_columns(conn)
     conn.execute("PRAGMA foreign_keys = ON")
 
     for name, department, blocks in DOCTORS:

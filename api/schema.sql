@@ -59,6 +59,10 @@ CREATE TABLE IF NOT EXISTS appointment (
   -- idempotency key from the phone call. A redial reuses it and must not
   -- produce a second appointment. NULL allowed for non-call bookings.
   call_id     TEXT UNIQUE,
+  -- Who this visit is for, when the booking said so. A patient row is one phone
+  -- number, and a parent's phone can bring several children.
+  visit_name       TEXT,
+  visit_birth_date TEXT,                             -- 'YYYY-MM-DD'
   status      TEXT NOT NULL DEFAULT 'BOOKED'
                    CHECK (status IN ('BOOKED','CANCELLED')),
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
