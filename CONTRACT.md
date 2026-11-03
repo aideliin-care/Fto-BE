@@ -52,8 +52,12 @@ agent greets by name and whether "cancel my appointment" has a referent.
 `limit` defaults to 5 — the agent must be able to read them aloud.
 
 ### `book`
-`POST /book` → `{call_id, slot_id, patient_name, phone}`
+`POST /book` → `{call_id, slot_id, patient_name, phone, patient_birth_date?}`
 → `{appointment_id, starts_at, doctor_name, status: "BOOKED"}`
+
+The phone number finds or creates the patient row. `patient_name` and
+`patient_birth_date` (`YYYY-MM-DD`) are also kept on the appointment, because one
+phone can book for several people: a parent's number and each of their children.
 
 Idempotent on `call_id`: the same `call_id` twice returns the first result
 rather than booking twice. If the slot was taken in the meantime, returns

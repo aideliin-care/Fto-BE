@@ -25,7 +25,7 @@ import uuid
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from binascii import Error as Base64Error
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime
 import json
 from pathlib import Path
 from secrets import compare_digest
@@ -221,6 +221,8 @@ class BookIn(BaseModel):
     slot_id: str = Field(min_length=1)
     patient_name: str = Field(min_length=1)
     phone: str = Field(min_length=1)
+    patient_birth_date: Optional[date] = Field(
+        default=None, description="Date of birth of the person the visit is for.")
 
 
 class RescheduleIn(BaseModel):
@@ -259,6 +261,8 @@ class DashboardPatient(BaseModel):
     id: str
     name: str
     phone: str
+    birth_date: Optional[str] = Field(
+        default=None, description="As given for this visit; null when none was.")
 
 
 class DashboardDoctor(BaseModel):
@@ -518,7 +522,8 @@ def dashboard_reservations(
         rows = conn.execute(
             """
             SELECT a.id AS appointment_id, a.status, a.created_at, a.updated_at,
-                   p.id AS patient_id, p.name AS patient_name, p.phone,
+                   p.id AS patient_id, COALESCE(a.visit_name, p.name) AS patient_name,
+                   p.phone, a.visit_birth_date,
                    d.id AS doctor_id, d.name AS doctor_name, d.department,
                    s.starts_at, s.ends_at
             FROM appointment a
@@ -550,7 +555,7 @@ def dashboard_reservations(
     items = [DashboardReservation(
         appointment_id=row["appointment_id"], status=row["status"],
         patient=DashboardPatient(id=row["patient_id"], name=row["patient_name"],
-                                 phone=row["phone"]),
+                                 phone=row["phone"], birth_date=row["visit_birth_date"]),
         doctor=DashboardDoctor(id=row["doctor_id"], name=row["doctor_name"],
                                department=row["department"]),
         starts_at=row["starts_at"], ends_at=row["ends_at"],
@@ -630,7 +635,8 @@ def dashboard_logs(
     try:
         rows = conn.execute(
             """
-            SELECT n.id, n.send_at, n.event, n.appointment_id, p.name AS patient_name,
+            SELECT n.id, n.send_at, n.event, n.appointment_id,
+                   COALESCE(a.visit_name, p.name) AS patient_name,
                    a.call_id, s.starts_at, d.name AS doctor_name,
                    prev.starts_at AS prev_starts_at
             FROM notification n
@@ -764,9 +770,10 @@ def book(body: BookIn) -> BookingOut:
         appointment_id = new_id()
         try:
             conn.execute(
-                "INSERT INTO appointment (id, slot_id, patient_id, call_id) "
-                "VALUES (?, ?, ?, ?)",
-                (appointment_id, body.slot_id, patient_id, body.call_id),
+                "INSERT INTO appointment (id, slot_id, patient_id, call_id, "
+                "visit_name, visit_birth_date) VALUES (?, ?, ?, ?, ?, ?)",
+                (appointment_id, body.slot_id, patient_id, body.call_id, body.patient_name,
+                 body.patient_birth_date.isoformat() if body.patient_birth_date else None),
             )
         except sqlite3.IntegrityError as exc:
             # Two callers can reach the INSERT with the same call_id if the
